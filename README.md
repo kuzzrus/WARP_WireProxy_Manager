@@ -503,6 +503,109 @@ scripts/check.sh
 
 ---
 
+## Экспериментальный Go-прототип (go-rewrite/)
+
+`go-rewrite/` — отдельный необязательный прототип: переписывание `wireproxy` +
+`warp-wireproxy-native.sh` в один Go-бинарь (`warpwp-go`). Это **не замена**
+основному проекту и не ставится вместе с ним по умолчанию — самостоятельный
+демон на своих портах, для тех, кто хочет попробовать альтернативную
+архитектуру.
+
+Чем отличается от bash-версии:
+
+- WireGuard поднимается в userspace прямо в процессе (`wireguard-go` +
+  `netstack`), без TUN-интерфейса и без root на биндинг.
+- Кандидатов пробует параллельно (горутина на кандидата), а не по одному —
+  без систематических `systemctl restart` на каждую проверку.
+- Постоянный демон с фоновым health-check и атомарной горячей заменой
+  endpoint'а вместо cron/timer.
+- Интерактивная TUI-панель (`warpwp-go menu`) и loopback control API
+  (`/status`, `/rescan`).
+- Опциональная обфускация через `nfqws` (проект zapret) на WARP-портах,
+  со своей подкомандой установки.
+
+### Установка на сервер
+
+Два канала релизов:
+
+- `dev-latest` — rolling pre-release, всегда пересобирается на актуальный
+  `main` при каждом релевантном коммите;
+- `go-vX.Y.Z` — версии для конкретных вех.
+
+Оба публикуются **без криптографической подписи** (в отличие от релизов
+`warpwp.sh`) — проверяется только `SHA256SUMS`.
+
+```bash
+TAG=dev-latest   # или конкретный go-vX.Y.Z
+ARCH=amd64       # или arm64
+BASE="https://github.com/kuzzrus/WARP_WireProxy_Manager/releases/download/$TAG"
+
+curl -fsSL "$BASE/warpwp-go-linux-$ARCH" -o /usr/local/bin/warpwp-go.new
+curl -fsSL "$BASE/SHA256SUMS" -o /tmp/SHA256SUMS
+grep "warpwp-go-linux-$ARCH" /tmp/SHA256SUMS \
+  | sed "s#warpwp-go-linux-$ARCH#/usr/local/bin/warpwp-go.new#" \
+  | sha256sum -c -
+chmod +x /usr/local/bin/warpwp-go.new
+mv /usr/local/bin/warpwp-go.new /usr/local/bin/warpwp-go
+
+curl -fsSL https://raw.githubusercontent.com/kuzzrus/WARP_WireProxy_Manager/main/go-rewrite/warpwp-go.service \
+  -o /etc/systemd/system/warpwp-go.service
+systemctl daemon-reload
+systemctl enable --now warpwp-go
+```
+
+Если `sha256sum -c` не напечатал `OK` — не продолжай, файл побился при
+загрузке. Скачивание через промежуточный `.new` + `mv` вместо перезаписи
+`/usr/local/bin/warpwp-go` напрямую важно при обновлении уже запущенного
+демона: перезапись исполняемого файла, который в этот момент выполняется,
+может упасть с `ETXTBSY`.
+
+По умолчанию демон слушает `127.0.0.1:41080` (SOCKS5) и `127.0.0.1:41081`
+(control API) — это **не** порт `wireproxy` (`40000` по умолчанию), оба
+могут работать одновременно на одном сервере, не мешая друг другу.
+
+### Команды
+
+| Команда | Что делает |
+|---|---|
+| `warpwp-go menu` | Интерактивная TUI-панель (живой статус, `r` — rescan, `q` — выход) |
+| `warpwp-go status` | JSON-статус текущего endpoint'а |
+| `warpwp-go rescan` | Форсировать пересканирование через control API |
+| `warpwp-go install-nfqws` | Собрать и поставить `nfqws` (zapret) из исходников |
+| `warpwp-go version` | Показать версию сборки |
+| `warpwp-go serve [флаги]` | Запустить демон напрямую — обычно не нужно, за это отвечает systemd-юнит |
+
+Основные флаги `serve`: `-listen`, `-control`, `-account`, `-force-register`,
+`-check-interval`, `-random`, `-obfuscate`, `-nfqws-bin`, `-nfqws-queue`,
+`-nfqws-args`.
+
+Управление сервисом — обычный systemd: `systemctl status|restart|stop warpwp-go`,
+логи — `journalctl -u warpwp-go -f`. Полное удаление:
+
+```bash
+systemctl disable --now warpwp-go
+rm -f /usr/local/bin/warpwp-go /etc/systemd/system/warpwp-go.service
+```
+
+`wireproxy`/`warp-wireproxy-native.sh` это не затрагивает никак — они
+полностью независимы друг от друга.
+
+### CI/релизы go-rewrite
+
+```text
+.github/workflows/go-check.yml       gofmt/vet/build/test на каждый push, трогающий go-rewrite/**
+.github/workflows/go-release.yml     сборка linux/amd64+arm64 + pre-release на тег go-v*.*.*
+.github/workflows/go-dev-latest.yml  пересборка и republish dev-latest на каждый push в main
+```
+
+Тот же набор проверок локально:
+
+```bash
+go-rewrite/check.sh
+```
+
+---
+
 ## Файлы в репозитории
 
 ```text
@@ -515,5 +618,6 @@ CHANGELOG.md               что менялось от версии к верс
 LICENSE                    MIT
 scripts/check.sh           локальный прогон тех же проверок, что в CI
 .shellcheck-version        версия shellcheck, закреплённая для CI и локали
-.github/workflows/         CI-проверки bash-скриптов
+.github/workflows/         CI-проверки bash-скриптов и go-rewrite
+go-rewrite/                экспериментальный Go-прототип (warpwp-go), см. раздел выше
 ```
