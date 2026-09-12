@@ -112,7 +112,7 @@ func teardownNfqwsQueue() {
 // nfqws (перезапуск при падении, как Restart=always у systemd, но локально).
 func startNfqws(ctx context.Context, cfg nfqwsConfig) (*nfqwsSupervisor, error) {
 	if _, err := exec.LookPath(cfg.bin); err != nil {
-		return nil, fmt.Errorf("nfqws бинарник %q не найден в PATH — это отдельный проект zapret (https://github.com/bol-van/zapret), его нужно поставить отдельно: %w", cfg.bin, err)
+		return nil, fmt.Errorf("nfqws бинарник %q не найден в PATH — поставь его: warpwp-go install-nfqws (или вручную из https://github.com/bol-van/zapret): %w", cfg.bin, err)
 	}
 	if err := setupNfqwsQueue(cfg); err != nil {
 		return nil, fmt.Errorf("nftables: %w", err)

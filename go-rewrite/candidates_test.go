@@ -38,3 +38,15 @@ func TestRandomEndpointsZero(t *testing.T) {
 		t.Fatalf("got %d endpoints, want 0", len(eps))
 	}
 }
+
+// Фиксирует фактический размер пространства сканирования, чтобы будущая
+// правка списков была осознанной, а не тихо потеряла диапазоны (как уже
+// однажды случилось при переносе из bash — потеряли 7 из 15 префиксов).
+func TestScanSpaceSize(t *testing.T) {
+	if len(warpPrefixes) != 19 {
+		t.Fatalf("got %d префиксов, want 19", len(warpPrefixes))
+	}
+	if len(warpPorts) != 54 {
+		t.Fatalf("got %d портов, want 54", len(warpPorts))
+	}
+}
