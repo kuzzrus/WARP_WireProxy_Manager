@@ -33,6 +33,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go-rewrite/go.mod
+          cache-dependency-path: go-rewrite/go.sum
 
       - name: Run project checks
         run: |
