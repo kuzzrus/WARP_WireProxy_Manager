@@ -39,11 +39,14 @@ func main() {
 		case "menu":
 			runMenu(os.Args[2:])
 			return
+		case "install-nfqws":
+			installNfqws(os.Args[2:])
+			return
 		case "serve":
 			runDaemon(os.Args[2:])
 			return
 		default:
-			log.Fatalf("неизвестная подкоманда %q (ожидалось: serve, status, rescan, menu, version)", os.Args[1])
+			log.Fatalf("неизвестная подкоманда %q (ожидалось: serve, status, rescan, menu, install-nfqws, version)", os.Args[1])
 		}
 	}
 	runDaemon(os.Args[1:]) // без подкоманды и с флагами сразу — как раньше, для обратной совместимости
