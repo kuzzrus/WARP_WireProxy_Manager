@@ -5,11 +5,15 @@
 
 set -Eeuo pipefail
 
-VERSION="1.2.3"
+VERSION="1.2.4"
 SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="40000"
 SOCKS_HOST_EXPLICIT="0"
 SOCKS_PORT_EXPLICIT="0"
+# Теневой (scan) инстанс wireproxy: перебор кандидатов гоняется через него,
+# а не через боевой systemd-сервис, чтобы не рвать активные соединения.
+SCAN_SOCKS_HOST="127.0.0.1"
+SCAN_SOCKS_PORT=""
 SCAN_COUNT="50"
 USE_CUSTOM_ENDPOINTS="0"
 FORCE_REGISTER="0"
@@ -52,6 +56,8 @@ TMP_DIR=""
 RESULT_FILE=""
 CANDIDATES_FILE=""
 WARPSCOUT_ACCOUNT_FILE=""
+SCAN_PROXY_CONF=""
+SCAN_PID_FILE=""
 INTERNAL_LOCK_FILE="/var/lock/warpwp-native.lock"
 INTERNAL_LOCK_HELD="0"
 SCAN_TRANSACTION_ACTIVE="0"
@@ -312,6 +318,8 @@ init_runtime() {
   RESULT_FILE="$TMP_DIR/results.tsv"
   CANDIDATES_FILE="$TMP_DIR/candidates.txt"
   WARPSCOUT_ACCOUNT_FILE="$TMP_DIR/warpscout-account.json"
+  SCAN_PROXY_CONF="$TMP_DIR/scan-proxy.conf"
+  SCAN_PID_FILE="$TMP_DIR/scan-wireproxy.pid"
   : > "$RESULT_FILE"
   : > "$CANDIDATES_FILE"
 }
@@ -705,21 +713,28 @@ EOF_SERVICE
 ensure_service_exists() { [[ -f "$SERVICE_FILE" ]] || systemctl list-unit-files 2>/dev/null | grep -q '^wireproxy\.service' && return 0; find_wireproxy_bin >/dev/null 2>&1 && [[ -f "$PROXY_CONF" ]] && { create_service; return 0; }; return 1; }
 # wireproxy занимает порт за доли секунды. Опрос вместо фиксированного
 # sleep 2 экономит почти всё время перебора кандидатов.
-socks_address() { printf '%s:%s' "$SOCKS_HOST" "$SOCKS_PORT"; }
+socks_address() { printf '%s:%s' "${1:-$SOCKS_HOST}" "${2:-$SOCKS_PORT}"; }
 socks_proxy_url() {
-  local host="$SOCKS_HOST"
+  local host="${1:-$SOCKS_HOST}" port="${2:-$SOCKS_PORT}"
   host="${host#[}"
   host="${host%]}"
   case "$host" in 0.0.0.0) host="127.0.0.1" ;; ::) host="::1" ;; esac
   [[ "$host" == *:* ]] && host="[$host]"
-  printf 'socks5h://%s:%s' "$host" "$SOCKS_PORT"
+  printf 'socks5h://%s:%s' "$host" "$port"
 }
 socks_port_listening() {
   local address
-  address="$(socks_address)"
+  address="$(socks_address "${1:-}" "${2:-}")"
   ss -H -lnt 2>/dev/null | awk -v address="$address" '$4 == address { found=1 } END { exit !found }'
 }
-wait_for_socks_port() { local i; for ((i = 0; i < PORT_WAIT_TRIES; i++)); do if socks_port_listening; then return 0; fi; sleep 0.1; done; return 1; }
+wait_for_socks_port() {
+  local host="${1:-}" port="${2:-}" i
+  for ((i = 0; i < PORT_WAIT_TRIES; i++)); do
+    if socks_port_listening "$host" "$port"; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
 restart_wireproxy() {
   ensure_service_exists || { err "wireproxy.service отсутствует, а $PROXY_CONF или бинарник wireproxy не найден."; return 1; }
   systemctl restart wireproxy || { err "Не удалось перезапустить wireproxy.service."; return 1; }
@@ -760,6 +775,10 @@ begin_scan_transaction() {
 
 restore_scan_original() {
   [[ "$SCAN_TRANSACTION_ACTIVE" == "1" ]] || return 0
+  # Перебор кандидатов больше не трогает боевой конфиг (см. test_endpoint),
+  # поэтому в подавляющем большинстве случаев восстанавливать нечего — и не
+  # нужно платить лишним restart wireproxy за откат несуществующего изменения.
+  [[ "$(get_current_endpoint || true)" != "$SCAN_ORIGINAL_ENDPOINT" ]] || return 0
   warn "Возвращаю исходный endpoint: $SCAN_ORIGINAL_ENDPOINT"
   set_endpoint "$SCAN_ORIGINAL_ENDPOINT" || return 1
   systemctl restart wireproxy >/dev/null 2>&1 || return 1
@@ -827,7 +846,7 @@ stability_check() {
   local first_time="$1" raw http_code warp time_total i successes=1 tail_failures=0 times
   times="$first_time"
   for ((i = 2; i <= STABILITY_PROBES; i++)); do
-    if ! raw="$(LC_ALL=C curl -m "$PROBE_TIMEOUT" -sS -x "$(socks_proxy_url)" -w '\n__TIME_TOTAL__=%{time_total}\n__HTTP_CODE__=%{http_code}\n' "$TEST_URL" 2>/dev/null)"; then
+    if ! raw="$(LC_ALL=C curl -m "$PROBE_TIMEOUT" -sS -x "$(socks_proxy_url "$SCAN_SOCKS_HOST" "$SCAN_SOCKS_PORT")" -w '\n__TIME_TOTAL__=%{time_total}\n__HTTP_CODE__=%{http_code}\n' "$TEST_URL" 2>/dev/null)"; then
       raw=""
     fi
     http_code="$(printf '%s\n' "$raw" | awk -F= '$1=="__HTTP_CODE__"{print $2; exit}')"
@@ -847,17 +866,79 @@ stability_check() {
   [[ "$successes" -ge $((STABILITY_PROBES - 1)) && "$LAST_STABILITY_TORN" == "0" ]]
 }
 
+scan_port_free() {
+  local port="$1"
+  ! ss -H -lnt 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | grep -qx "$port"
+}
+
+pick_scan_socks_port() {
+  local port=$((SOCKS_PORT + 1)) tries=0
+  [[ "$port" -le 65535 ]] || port=20000
+  while [[ "$tries" -lt 200 ]]; do
+    if scan_port_free "$port"; then printf '%s' "$port"; return 0; fi
+    port=$((port + 1))
+    [[ "$port" -le 65535 ]] || port=20000
+    tries=$((tries + 1))
+  done
+  return 1
+}
+
+init_scan_proxy_conf() {
+  [[ -f "$PROXY_CONF" ]] || { err "Не найден $PROXY_CONF для scan-конфига."; return 1; }
+  cp "$PROXY_CONF" "$SCAN_PROXY_CONF" || return 1
+  chmod 600 "$SCAN_PROXY_CONF"
+  grep -qi '^BindAddress[[:space:]]*=' "$SCAN_PROXY_CONF" || { err "В $SCAN_PROXY_CONF отсутствует BindAddress."; return 1; }
+  sed -i "s#^BindAddress[[:space:]]*=.*#BindAddress = $SCAN_SOCKS_HOST:$SCAN_SOCKS_PORT#I" "$SCAN_PROXY_CONF" || return 1
+}
+
+set_scan_endpoint() {
+  local ep="$1"
+  valid_endpoint "$ep" || { err "Отказ менять scan-конфиг на некорректный endpoint: $ep"; return 1; }
+  grep -qi '^Endpoint[[:space:]]*=' "$SCAN_PROXY_CONF" || { err "В $SCAN_PROXY_CONF отсутствует Endpoint."; return 1; }
+  sed -i "s#^Endpoint[[:space:]]*=.*#Endpoint = $ep#I" "$SCAN_PROXY_CONF" || { err "Не удалось обновить Endpoint в $SCAN_PROXY_CONF."; return 1; }
+}
+
+# Кандидатов гоняем через одноразовый background-процесс wireproxy на отдельном
+# порту, а не через systemctl restart wireproxy — так перебор ни разу не
+# трогает боевой SOCKS5, которым в это время пользуется Xray.
+stop_scan_wireproxy() {
+  [[ -f "$SCAN_PID_FILE" ]] || return 0
+  local pid="" i
+  pid="$(cat "$SCAN_PID_FILE" 2>/dev/null || true)"
+  rm -f "$SCAN_PID_FILE"
+  [[ -n "$pid" ]] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill "$pid" 2>/dev/null || true
+  for ((i = 0; i < 30; i++)); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+restart_scan_wireproxy() {
+  local bin
+  bin="$(find_wireproxy_bin)" || { err "wireproxy бинарник не найден для scan-инстанса."; return 1; }
+  stop_scan_wireproxy
+  "$bin" -c "$SCAN_PROXY_CONF" >"$TMP_DIR/scan-wireproxy.log" 2>&1 &
+  echo $! > "$SCAN_PID_FILE"
+  wait_for_socks_port "$SCAN_SOCKS_HOST" "$SCAN_SOCKS_PORT" || {
+    err "Теневой wireproxy не поднял SOCKS5 $SCAN_SOCKS_HOST:$SCAN_SOCKS_PORT."
+    return 1
+  }
+}
+
 test_endpoint() {
   local ep="$1" trace_file="$TMP_DIR/trace" rc=0 warp ip colo loc time_total http_code policy
-  if ! set_endpoint "$ep"; then
+  if ! set_scan_endpoint "$ep"; then
     printf '%s\tFAIL\tconfig_update\t-\t-\t-\t-\t100\t0\t-\t%s\n' "$ep" "$CURRENT_SCANNER" >> "$RESULT_FILE"
     return 1
   fi
-  if ! restart_wireproxy; then
+  if ! restart_scan_wireproxy; then
     printf '%s\tFAIL\tservice_restart\t-\t-\t-\t-\t100\t0\t-\t%s\n' "$ep" "$CURRENT_SCANNER" >> "$RESULT_FILE"
     return 1
   fi
-  LC_ALL=C curl -m "$PROBE_TIMEOUT" -sS -x "$(socks_proxy_url)" -w '\n__TIME_TOTAL__=%{time_total}\n__HTTP_CODE__=%{http_code}\n' "$TEST_URL" > "$trace_file" 2>/dev/null || rc=$?
+  LC_ALL=C curl -m "$PROBE_TIMEOUT" -sS -x "$(socks_proxy_url "$SCAN_SOCKS_HOST" "$SCAN_SOCKS_PORT")" -w '\n__TIME_TOTAL__=%{time_total}\n__HTTP_CODE__=%{http_code}\n' "$TEST_URL" > "$trace_file" 2>/dev/null || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     printf '%s\tFAIL\tcurl_rc=%s\t-\t-\t-\t-\t100\t0\t-\t%s\n' "$ep" "$rc" "$CURRENT_SCANNER" >> "$RESULT_FILE"
     remember_bad_endpoint "$ep"
@@ -900,7 +981,7 @@ pick_best_line() {
 }
 
 apply_best_line() {
-  local best_line="$1" already_active="${2:-0}"
+  local best_line="$1"
   BEST_ENDPOINT="$(printf '%s' "$best_line" | awk -F'\t' '{print $1}')"
   BEST_TIME="$(printf '%s' "$best_line" | awk -F'\t' '{print $3}')"
   BEST_COLO="$(printf '%s' "$best_line" | awk -F'\t' '{print $5}')"
@@ -908,12 +989,10 @@ apply_best_line() {
   BEST_LOSS="$(printf '%s' "$best_line" | awk -F'\t' '{print $8}')"
   BEST_STABLE="$(printf '%s' "$best_line" | awk -F'\t' '{print $9}')"
   BEST_SCANNER="$(printf '%s' "$best_line" | awk -F'\t' '{print $11}')"
+  # Победитель был проверен только на теневом инстансе — боевой сервис ещё
+  # ни разу не переключался на него, поэтому restart здесь всегда нужен.
   set_endpoint "$BEST_ENDPOINT" || return 1
-  if [[ "$already_active" != "1" ]]; then
-    restart_wireproxy || return 1
-  else
-    wait_for_socks_port || return 1
-  fi
+  restart_wireproxy || return 1
   remember_good_endpoint "$BEST_ENDPOINT" "$BEST_TIME" "$BEST_COLO" "$BEST_LOC" "$BEST_LOSS" "$BEST_STABLE" "$BEST_SCANNER"
   ok "Выбран endpoint: $BEST_ENDPOINT time_total=$BEST_TIME probe_loss=${BEST_LOSS}% colo=$BEST_COLO loc=$BEST_LOC scanner=$BEST_SCANNER"
 }
@@ -922,17 +1001,17 @@ select_best_endpoint_native() {
   CURRENT_SCANNER="native"
   generate_endpoint_candidates
   : > "$RESULT_FILE"
-  local ep best_line total good_count=0 tested=0 last_ok_ep=""
-  # Перебор переписывает Endpoint прямо в боевом конфиге, поэтому запоминаем
-  # исходный: если ни один кандидат не взлетит, надо вернуть как было, а не
-  # оставить в proxy.conf последний случайный адрес.
+  local ep best_line total good_count=0 tested=0
+  # Каждый test_endpoint здесь перезапускает только теневой инстанс на
+  # SCAN_SOCKS_PORT (см. select_best_endpoint), боевой $PROXY_CONF во время
+  # перебора не трогается вообще — его меняет только apply_best_line в конце,
+  # ровно один раз, на уже выбранного победителя.
   total="$(wc -l < "$CANDIDATES_FILE" | tr -d ' ')"
   while IFS= read -r ep; do
     [[ -z "$ep" ]] && continue
     tested=$((tested + 1))
     log "Проверяю $ep"
     if test_endpoint "$ep"; then
-      last_ok_ep="$ep"
       if [[ "$LAST_POLICY_MATCH" == "1" ]]; then
         ok "$ep работает и соответствует policy"
         good_count=$((good_count + 1))
@@ -947,6 +1026,7 @@ select_best_endpoint_native() {
       warn "$ep не подошёл"
     fi
   done < "$CANDIDATES_FILE"
+  stop_scan_wireproxy
   if [[ "$tested" -lt "$total" ]]; then log "Проверено кандидатов: $tested из $total (ранняя остановка)."; fi
   echo; echo "=== Результаты проверки ==="
   command -v column >/dev/null 2>&1 && column -t -s $'\t' "$RESULT_FILE" || cat "$RESULT_FILE"
@@ -958,12 +1038,7 @@ select_best_endpoint_native() {
     err "Не найден стабильный endpoint с warp=on, подходящий под policy: $(policy_summary)"
     exit 1
   fi
-  # Если лучшим оказался endpoint, который только что был протестирован
-  # последним, wireproxy уже перезапущен на него внутри test_endpoint — второй
-  # restart подряд не нужен, достаточно убедиться, что порт всё ещё слушает.
-  local already_active=0
-  [[ "$(printf '%s' "$best_line" | awk -F'\t' '{print $1}')" == "$last_ok_ep" ]] && already_active=1
-  apply_best_line "$best_line" "$already_active" || return 1
+  apply_best_line "$best_line" || return 1
 }
 
 find_warpscout_bin() {
@@ -1034,27 +1109,29 @@ select_best_endpoint_warpscout() {
   CURRENT_SCANNER="warpscout"
   log "Финально проверяю найденный WARPSCOUT endpoint через wireproxy: $endpoint"
   if ! test_endpoint "$endpoint"; then
+    stop_scan_wireproxy
     warn "WARPSCOUT endpoint не прошёл финальную проверку Manager."
-    restore_scan_original || return 1
     return 1
   fi
+  stop_scan_wireproxy
   if [[ "$LAST_POLICY_MATCH" != "1" ]]; then
     if [[ "$POLICY_MODE" == "prefer" && "$SCANNER" == "warpscout" ]]; then
       warn "WARPSCOUT endpoint не соответствует policy; принимаю fallback в mode=prefer."
     else
       warn "WARPSCOUT endpoint не соответствует policy; ищу другой через native scanner."
-      restore_scan_original || return 1
       return 1
     fi
   fi
   best_line="$(awk -F'\t' '$2=="OK"{print $0; exit}' "$RESULT_FILE")"
   [[ -n "$best_line" ]] || return 1
-  apply_best_line "$best_line" "1" || return 1
+  apply_best_line "$best_line" || return 1
   return 0
 }
 
 select_best_endpoint() {
   begin_scan_transaction || exit 1
+  SCAN_SOCKS_PORT="$(pick_scan_socks_port)" || { err "Не нашёл свободный локальный порт для теневого инстанса wireproxy."; exit 1; }
+  init_scan_proxy_conf || exit 1
   case "$SCANNER" in
     native) select_best_endpoint_native ;;
     warpscout)
@@ -1167,6 +1244,7 @@ EOF_RESULT
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
+  stop_scan_wireproxy
   rollback_registration_transaction
   rollback_scan_transaction
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" && "$TMP_DIR" == /tmp/warp-wireproxy-native.* ]]; then rm -rf -- "$TMP_DIR"; fi

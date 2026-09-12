@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.3.6"
+VERSION="1.3.7"
 REPO_SLUG="kuzzrus/WARP_WireProxy_Manager"
 GITHUB_API="https://api.github.com/repos/$REPO_SLUG"
 RELEASE_DOWNLOAD_BASE="https://github.com/$REPO_SLUG/releases/download"

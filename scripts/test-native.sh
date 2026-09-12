@@ -56,6 +56,46 @@ FAKE_SOCKS_LISTENING="1"; FAKE_WIREPROXY_ACTIVE="0"
 expect_true "inactive wireproxy restarts" ensure_wireproxy_ready_for_check
 [[ "$FAKE_RESTARTS" == "2" ]] || fail "inactive wireproxy did not restart"
 
+# Candidate scanning must run entirely against the disposable scan instance:
+# production's wireproxy.service/PROXY_CONF may only change once, from
+# apply_best_line, after a winner is already known.
+NODE_ALLOW=""; NODE_DENY=""; COUNTRY_ALLOW=""; COUNTRY_DENY=""; POLICY_MODE="prefer"
+PROD_RESTARTS=0; PROD_SET_ENDPOINT_CALLS=0
+restart_wireproxy() { PROD_RESTARTS=$((PROD_RESTARTS + 1)); }
+set_endpoint() { PROD_SET_ENDPOINT_CALLS=$((PROD_SET_ENDPOINT_CALLS + 1)); }
+find_wireproxy_bin() { printf '%s' "true"; }
+wait_for_socks_port() { return 0; }
+curl() { printf 'ip=1.1.1.1\ncolo=HEL\nloc=DE\nwarp=on\n__TIME_TOTAL__=0.100000\n__HTTP_CODE__=200\n'; }
+STABILITY_PROBES="1"
+CURRENT_SCANNER="native"
+TMP_DIR="$tmp_dir"
+WG_DIR="$tmp_dir/shadow-scan-wg"
+GOOD_ENDPOINTS_FILE="$WG_DIR/warp-endpoints.good"
+BAD_ENDPOINTS_FILE="$WG_DIR/warp-endpoints.bad"
+PROXY_CONF="$tmp_dir/proxy.conf"
+cat > "$PROXY_CONF" <<'CONF'
+[Peer]
+Endpoint = old.example.com:1111
+
+[Socks5]
+BindAddress = 127.0.0.1:40000
+CONF
+SCAN_PROXY_CONF="$tmp_dir/scan-proxy.conf"
+SCAN_PID_FILE="$tmp_dir/scan-wireproxy.pid"
+SCAN_SOCKS_PORT="41000"
+init_scan_proxy_conf
+RESULT_FILE="$tmp_dir/scan-results.tsv"; : > "$RESULT_FILE"
+expect_true "shadow candidate probe succeeds" test_endpoint "162.159.192.5:2408"
+[[ "$PROD_RESTARTS" == "0" ]] || fail "test_endpoint must not restart production wireproxy"
+[[ "$PROD_SET_ENDPOINT_CALLS" == "0" ]] || fail "test_endpoint must not rewrite production PROXY_CONF"
+grep -q '^Endpoint = 162.159.192.5:2408' "$SCAN_PROXY_CONF" || fail "scan config must carry the tested candidate"
+grep -q '^Endpoint = old.example.com:1111' "$PROXY_CONF" || fail "production config must stay untouched while scanning"
+best_line="$(pick_best_line "$RESULT_FILE")"
+[[ -n "$best_line" ]] || fail "shadow probe did not produce a winning candidate"
+apply_best_line "$best_line"
+[[ "$PROD_RESTARTS" == "1" ]] || fail "apply_best_line must restart production exactly once"
+[[ "$PROD_SET_ENDPOINT_CALLS" == "1" ]] || fail "apply_best_line must write the winner into production exactly once"
+
 RESULT_FILE="$tmp_dir/results.tsv"
 printf '%s\n' \
   $'fast-fallback:2408\tOK\t0.050000\t1.1.1.1\tDME\tRU\ton\t0\t1\tMISMATCH\tnative' \
@@ -169,15 +209,15 @@ SH
     LAST_POLICY_MATCH="1"
     printf '%s\tOK\t0.123000\t1.1.1.1\tHEL\tDE\ton\t0\t1\tMATCH\twarpscout\n' "$1" >> "$RESULT_FILE"
   }
-  APPLIED_LINE=""; APPLIED_ACTIVE=""
-  apply_best_line() { APPLIED_LINE="$1"; APPLIED_ACTIVE="${2:-0}"; }
+  APPLIED_LINE=""
+  apply_best_line() { APPLIED_LINE="$1"; }
   SCAN_COUNT="25"; WARPSCOUT_JOBS="4"; STABILITY_PROBES="7"
   NODE_ALLOW="HEL,ARN"; NODE_DENY=""; COUNTRY_ALLOW=""; COUNTRY_DENY=""
   USE_CUSTOM_ENDPOINTS="0"; POLICY_MODE="strict"; SCANNER="warpscout"
   select_best_endpoint_warpscout >/dev/null 2>&1 || fail "WARPSCOUT integration"
   arg_value() { awk -v key="$1" '$0==key {getline; print; exit}' "$WARPWP_FAKE_ARGS"; }
   [[ "$(arg_value -n):$(arg_value -jt):$(arg_value -tun-ping-count):$(arg_value -node)" == "2:4:7:HEL,ARN" ]] || fail "WARPSCOUT arguments"
-  [[ "$(cut -f1 <<< "$APPLIED_LINE"):$APPLIED_ACTIVE" == "162.159.192.9:2408:1" ]] || fail "WARPSCOUT selected endpoint"
+  [[ "$(cut -f1 <<< "$APPLIED_LINE")" == "162.159.192.9:2408" ]] || fail "WARPSCOUT selected endpoint"
 fi
 
 expect_true "valid IPv4 endpoint" valid_scanned_endpoint 162.159.192.1:2408
