@@ -1,0 +1,83 @@
+name: Go prototype release
+
+# Отдельный namespace тегов (go-v*), чтобы не путаться с релизами
+# warpwp/warp-wireproxy-native.sh (те — v*.*.*). Публикуется без подписи:
+# в отличие от bash-релизов, здесь пока нет warpwp-go update, который бы
+# эту подпись проверял — подписывать нечего верифицировать, это было бы
+# формой без функции. Помечено как pre-release: это исследовательский
+# прототип, а не замена основному проекту.
+on:
+  push:
+    tags:
+      - 'go-v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-rewrite
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-rewrite/go.mod
+
+      - name: Run project checks
+        run: |
+          chmod +x check.sh
+          ./check.sh
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" \
+            -o "warpwp-go-linux-${{ matrix.goarch }}" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: warpwp-go-linux-${{ matrix.goarch }}
+          path: go-rewrite/warpwp-go-linux-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub pre-release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: release-assets
+        run: |
+          chmod 755 warpwp-go-linux-*
+          sha256sum warpwp-go-linux-* > SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "warpwp-go (prototype) $GITHUB_REF_NAME" \
+            --prerelease \
+            --notes "Экспериментальный Go-прототип WARP WireProxy Manager. Не подписано, не заменяет основной проект (warpwp/warp-wireproxy-native.sh). SHA256SUMS приложен для сверки, криптографической подписи нет."

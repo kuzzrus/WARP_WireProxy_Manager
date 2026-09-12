@@ -1,0 +1,38 @@
+name: Go checks
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'go-rewrite/**'
+      - '.github/workflows/go-check.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'go-rewrite/**'
+      - '.github/workflows/go-check.yml'
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: gofmt, vet, build, test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-rewrite
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-rewrite/go.mod
+
+      - name: Run project checks
+        run: |
+          chmod +x check.sh
+          ./check.sh

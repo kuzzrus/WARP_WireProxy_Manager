@@ -1,0 +1,15 @@
+[Unit]
+Description=WARP WireProxy Manager (Go rewrite prototype)
+Documentation=https://github.com/kuzzrus/WARP_WireProxy_Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/warpwp-go serve -listen 127.0.0.1:41080 -control 127.0.0.1:41081 -account /etc/wireguard/warpwp-go-account.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
