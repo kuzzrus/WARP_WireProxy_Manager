@@ -1,0 +1,100 @@
+name: Go dev-latest
+
+# Rolling pre-release: пересобирается на каждый push в main, который трогает
+# go-rewrite/**, и переставляет тег dev-latest на новый коммит. Решает
+# конкретную проблему: помеченные версии (go-v0.1.0 и т.д.) устаревают
+# сразу после следующего коммита, и то, что реально стоит на сервере,
+# незаметно расходится с main. dev-latest всегда указывает на актуальный
+# main — ценой того, что это не стабильная версия, а именно последний
+# прошедший проверки коммит.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'go-rewrite/**'
+      - '.github/workflows/go-dev-latest.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-rewrite
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-rewrite/go.mod
+          cache-dependency-path: go-rewrite/go.sum
+
+      - name: Run project checks
+        run: |
+          chmod +x check.sh
+          ./check.sh
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags "-s -w -X main.version=dev-latest-$(git rev-parse --short HEAD)" \
+            -o "warpwp-go-linux-${{ matrix.goarch }}" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: warpwp-go-linux-${{ matrix.goarch }}
+          path: go-rewrite/warpwp-go-linux-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  publish:
+    name: Move dev-latest tag and republish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: release-assets
+        run: |
+          chmod 755 warpwp-go-linux-*
+          sha256sum warpwp-go-linux-* > SHA256SUMS
+
+      - name: Move dev-latest tag to this commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f dev-latest
+          git push origin dev-latest --force
+
+      - name: Replace dev-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dev-latest --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create dev-latest release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "warpwp-go dev-latest ($(git rev-parse --short HEAD))" \
+            --prerelease \
+            --notes "Автосборка последнего main (go-rewrite/), пересобирается на каждый релевантный push. Не подписано, экспериментальный прототип — не заменяет warpwp/warp-wireproxy-native.sh. Помеченные версии (go-v*.*.*) остаются отдельно для конкретных вех."
