@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.3.5"
+VERSION="1.3.6"
 REPO_SLUG="kuzzrus/WARP_WireProxy_Manager"
 GITHUB_API="https://api.github.com/repos/$REPO_SLUG"
 RELEASE_DOWNLOAD_BASE="https://github.com/$REPO_SLUG/releases/download"
@@ -280,7 +280,7 @@ install_cron_check() {
   if [[ ! -x "$NATIVE_BIN" ]]; then warn "Локальный native-скрипт не найден. Сначала обновляю скрипты."; update_local_scripts || return 1; fi
   ensure_cron_daemon || return 1
   cron_svc="$(cron_daemon_name)" || return 1
-  if command -v flock >/dev/null 2>&1; then check_cmd="flock -n $LOCK_FILE $NATIVE_BIN --check --scan-count $DEFAULT_SCAN_COUNT"; else warn "flock недоступен. Cron будет без lock-защиты."; check_cmd="$NATIVE_BIN --check --scan-count $DEFAULT_SCAN_COUNT"; fi
+  if command -v flock >/dev/null 2>&1; then check_cmd="flock -n $LOCK_FILE $NATIVE_BIN --check --scan-count $DEFAULT_SCAN_COUNT --enough-good 1"; else warn "flock недоступен. Cron будет без lock-защиты."; check_cmd="$NATIVE_BIN --check --scan-count $DEFAULT_SCAN_COUNT --enough-good 1"; fi
   mkdir -p "$(dirname "$CRON_FILE")"
   cron_tmp="$(mktemp "${CRON_FILE}.tmp.XXXXXX")"
   cron_backup="$(mktemp "${CRON_FILE}.bak.XXXXXX")"
@@ -311,7 +311,7 @@ install_timer_check() {
   if [[ ! -x "$NATIVE_BIN" ]]; then warn "Локальный native-скрипт не найден. Сначала обновляю скрипты."; update_local_scripts || return 1; fi
   local minutes exec_cmd service_tmp timer_tmp env_tmp service_backup timer_backup env_backup had_service=0 had_timer=0 had_env=0
   minutes="$(ask_timer_minutes "${1:-}")"
-  if command -v flock >/dev/null 2>&1; then exec_cmd="/usr/bin/flock -n $LOCK_FILE $NATIVE_BIN --check --scan-count $DEFAULT_SCAN_COUNT"; else warn "flock недоступен. Timer будет без lock-защиты."; exec_cmd="$NATIVE_BIN --check --scan-count $DEFAULT_SCAN_COUNT"; fi
+  if command -v flock >/dev/null 2>&1; then exec_cmd="/usr/bin/flock -n $LOCK_FILE $NATIVE_BIN --check --scan-count $DEFAULT_SCAN_COUNT --enough-good 1"; else warn "flock недоступен. Timer будет без lock-защиты."; exec_cmd="$NATIVE_BIN --check --scan-count $DEFAULT_SCAN_COUNT --enough-good 1"; fi
   mkdir -p "$(dirname "$TIMER_SERVICE_FILE")" "$(dirname "$TIMER_ENV_FILE")"
   service_tmp="$(mktemp "${TIMER_SERVICE_FILE}.tmp.XXXXXX")"
   timer_tmp="$(mktemp "${TIMER_FILE}.tmp.XXXXXX")"

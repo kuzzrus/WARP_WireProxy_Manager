@@ -87,11 +87,29 @@ expect_true "stable probe series" stability_check 0.100000
 expect_false "trailing teardown" stability_check 0.100000
 [[ "$LAST_STABILITY_LOSS:$LAST_STABILITY_TORN" == "40:1" ]] || fail "teardown metrics"
 
+QUICK_CHECK_RETRY_DELAY="0"
 curl() {
   printf 'warp=on\n__TIME_TOTAL__=0.100000\n__HTTP_CODE__=200\n'
   return 56
 }
 expect_false "partial curl output must not pass WARP check" quick_warp_check
+
+# A single transient failure must not be treated as a dead tunnel: the
+# scheduler used to skip straight to a full endpoint rescan (and several
+# forced wireproxy restarts) on one bad probe.
+FAKE_QUICK_RETRY_STATE="$tmp_dir/quick-retry-state"
+curl() {
+  local n=0
+  [[ -f "$FAKE_QUICK_RETRY_STATE" ]] && n="$(cat "$FAKE_QUICK_RETRY_STATE")"
+  n=$((n + 1)); printf '%s' "$n" > "$FAKE_QUICK_RETRY_STATE"
+  if [[ "$n" -eq 1 ]]; then
+    return 28
+  fi
+  printf 'ip=1.1.1.1\ncolo=HEL\nloc=DE\nwarp=on\n__TIME_TOTAL__=0.100000\n__HTTP_CODE__=200\n'
+}
+get_current_endpoint() { printf '%s' ''; }
+expect_true "quick check recovers after one transient failure" quick_warp_check
+[[ "$(cat "$FAKE_QUICK_RETRY_STATE")" == "2" ]] || fail "quick check must retry before giving up"
 
 WG_DIR="$tmp_dir/wireguard"
 GOOD_ENDPOINTS_FILE="$WG_DIR/warp-endpoints.good"

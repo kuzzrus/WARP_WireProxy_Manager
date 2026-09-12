@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="40000"
 SOCKS_HOST_EXPLICIT="0"
@@ -31,6 +31,12 @@ ENOUGH_GOOD="3"
 PROBE_TIMEOUT="8"     # curl-таймаут при переборе кандидатов
 FINAL_TIMEOUT="15"    # curl-таймаут финальной проверки
 PORT_WAIT_TRIES="30"  # 30 x 0.1s = 3s ожидания, пока wireproxy займёт порт
+# Единственный HTTP-запрос через SOCKS5 может провалиться из-за случайной
+# заминки (потеря пакета, медленный DNS через WARP), а не потому что туннель
+# правда мёртв. Без повторной попытки такая заминка запускала полный перебор
+# endpoint'ов и несколько restart wireproxy на ровном месте.
+QUICK_CHECK_RETRIES="2"      # попыток quick_warp_check перед тем как считать WARP мёртвым
+QUICK_CHECK_RETRY_DELAY="2"  # секунд паузы между попытками quick_warp_check
 
 WG_DIR="/etc/wireguard"
 WARP_CONF="$WG_DIR/warp.wireproxy.conf"
@@ -775,15 +781,22 @@ commit_scan_transaction() {
 }
 
 quick_warp_check() {
-  local raw trace endpoint time_total http_code colo loc cache_line _ep _time _colo _loc _ts cached_loss cached_stable cached_scanner
-  if ! raw="$(LC_ALL=C curl -m "$PROBE_TIMEOUT" -sS -x "$(socks_proxy_url)" -w '\n__TIME_TOTAL__=%{time_total}\n__HTTP_CODE__=%{http_code}\n' "$TEST_URL" 2>/dev/null)"; then
-    return 1
-  fi
-  trace="$(printf '%s\n' "$raw" | grep -E '^(ip|colo|loc|warp)=' || true)"
+  local raw trace endpoint time_total http_code colo loc cache_line _ep _time _colo _loc _ts cached_loss cached_stable cached_scanner attempt ok=0
+  for ((attempt = 1; attempt <= QUICK_CHECK_RETRIES; attempt++)); do
+    raw="$(LC_ALL=C curl -m "$PROBE_TIMEOUT" -sS -x "$(socks_proxy_url)" -w '\n__TIME_TOTAL__=%{time_total}\n__HTTP_CODE__=%{http_code}\n' "$TEST_URL" 2>/dev/null)" || raw=""
+    trace="$(printf '%s\n' "$raw" | grep -E '^(ip|colo|loc|warp)=' || true)"
+    http_code="$(printf '%s\n' "$raw" | awk -F= '$1=="__HTTP_CODE__"{print $2; exit}')"
+    if [[ "$http_code" == "200" ]] && printf '%s\n' "$trace" | grep -q '^warp=on$'; then
+      ok=1
+      break
+    fi
+    if [[ "$attempt" -lt "$QUICK_CHECK_RETRIES" ]]; then
+      warn "quick-check не прошёл с попытки $attempt/$QUICK_CHECK_RETRIES, повторяю через ${QUICK_CHECK_RETRY_DELAY}с..."
+      sleep "$QUICK_CHECK_RETRY_DELAY"
+    fi
+  done
   BEST_TRACE="$trace"
-  http_code="$(printf '%s\n' "$raw" | awk -F= '$1=="__HTTP_CODE__"{print $2; exit}')"
-  [[ "$http_code" == "200" ]] || return 1
-  printf '%s\n' "$trace" | grep -q '^warp=on$' || return 1
+  [[ "$ok" -eq 1 ]] || return 1
   endpoint="$(get_current_endpoint || true)"
   colo="$(printf '%s\n' "$trace" | awk -F= '$1=="colo"{print $2; exit}')"
   loc="$(printf '%s\n' "$trace" | awk -F= '$1=="loc"{print $2; exit}')"
@@ -909,7 +922,7 @@ select_best_endpoint_native() {
   CURRENT_SCANNER="native"
   generate_endpoint_candidates
   : > "$RESULT_FILE"
-  local ep best_line total good_count=0 tested=0
+  local ep best_line total good_count=0 tested=0 last_ok_ep=""
   # Перебор переписывает Endpoint прямо в боевом конфиге, поэтому запоминаем
   # исходный: если ни один кандидат не взлетит, надо вернуть как было, а не
   # оставить в proxy.conf последний случайный адрес.
@@ -919,6 +932,7 @@ select_best_endpoint_native() {
     tested=$((tested + 1))
     log "Проверяю $ep"
     if test_endpoint "$ep"; then
+      last_ok_ep="$ep"
       if [[ "$LAST_POLICY_MATCH" == "1" ]]; then
         ok "$ep работает и соответствует policy"
         good_count=$((good_count + 1))
@@ -944,7 +958,12 @@ select_best_endpoint_native() {
     err "Не найден стабильный endpoint с warp=on, подходящий под policy: $(policy_summary)"
     exit 1
   fi
-  apply_best_line "$best_line" || return 1
+  # Если лучшим оказался endpoint, который только что был протестирован
+  # последним, wireproxy уже перезапущен на него внутри test_endpoint — второй
+  # restart подряд не нужен, достаточно убедиться, что порт всё ещё слушает.
+  local already_active=0
+  [[ "$(printf '%s' "$best_line" | awk -F'\t' '{print $1}')" == "$last_ok_ep" ]] && already_active=1
+  apply_best_line "$best_line" "$already_active" || return 1
 }
 
 find_warpscout_bin() {

@@ -263,10 +263,10 @@ fi
 ensure_cron_installed
 
 if command -v flock >/dev/null 2>&1; then
-  CHECK_CMD="flock -n $LOCK_FILE $LOCAL_SCRIPT --check --scan-count $SCAN_COUNT"
+  CHECK_CMD="flock -n $LOCK_FILE $LOCAL_SCRIPT --check --scan-count $SCAN_COUNT --enough-good 1"
 else
   warn "flock не найден. Cron будет без lock-защиты."
-  CHECK_CMD="$LOCAL_SCRIPT --check --scan-count $SCAN_COUNT"
+  CHECK_CMD="$LOCAL_SCRIPT --check --scan-count $SCAN_COUNT --enough-good 1"
 fi
 
 log "Скачиваю локальную копию warp-wireproxy-native.sh..."
