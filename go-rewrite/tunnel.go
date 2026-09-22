@@ -32,11 +32,70 @@ type tunnel struct {
 	endpoint string
 	tnet     netDialer
 	dev      *device.Device
+	mu       sync.Mutex
+	clients  int
+	retired  bool
+	closed   bool
 }
 
 func (t *tunnel) Close() {
-	if t != nil && t.dev != nil {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closeLocked()
+}
+
+func (t *tunnel) closeLocked() {
+	if t.closed {
+		return
+	}
+	t.closed = true
+	if t.dev != nil {
 		t.dev.Close()
+	}
+}
+
+// Borrow keeps a tunnel alive for one SOCKS connection. A tunnel that has
+// already been retired after an endpoint switch is never selected for new
+// connections, but the existing ones may finish without a fixed deadline.
+func (t *tunnel) Borrow() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.retired || t.closed {
+		return false
+	}
+	t.clients++
+	return true
+}
+
+func (t *tunnel) Release() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.clients > 0 {
+		t.clients--
+	}
+	if t.retired && t.clients == 0 {
+		t.closeLocked()
+	}
+}
+
+func (t *tunnel) Retire() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.retired = true
+	if t.clients == 0 {
+		t.closeLocked()
 	}
 }
 
@@ -70,10 +129,12 @@ func dialTunnel(acct *account, endpoint string) (*tunnel, error) {
 // probeTunnel — эквивалент quick_warp_check/test_endpoint из bash-версии:
 // настоящий HTTP-запрос через сам туннель, а не просто "хендшейк прошёл".
 func probeTunnel(ctx context.Context, t *tunnel, timeout time.Duration) (time.Duration, string, error) {
+	transport := &http.Transport{DialContext: t.tnet.DialContext}
 	client := &http.Client{
-		Transport: &http.Transport{DialContext: t.tnet.DialContext},
+		Transport: transport,
 		Timeout:   timeout,
 	}
+	defer transport.CloseIdleConnections()
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.cloudflare.com/cdn-cgi/trace", nil)
 	if err != nil {
@@ -84,9 +145,15 @@ func probeTunnel(ctx context.Context, t *tunnel, timeout time.Duration) (time.Du
 		return time.Since(start), "", err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return time.Since(start), "", err
+	}
 	elapsed := time.Since(start)
-	if !bytes.Contains(data, []byte("warp=on")) {
+	if resp.StatusCode != http.StatusOK {
+		return elapsed, string(data), fmt.Errorf("trace HTTP %d", resp.StatusCode)
+	}
+	if !bytes.Contains(data, []byte("\nwarp=on\n")) && !bytes.HasPrefix(data, []byte("warp=on\n")) && !bytes.HasSuffix(data, []byte("\nwarp=on")) {
 		return elapsed, string(data), fmt.Errorf("warp=on не найден в trace")
 	}
 	return elapsed, string(data), nil

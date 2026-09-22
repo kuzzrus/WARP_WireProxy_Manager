@@ -37,6 +37,9 @@ func fetchControlJSON(url, method string) (*statusResponse, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("control API returned HTTP %d", resp.StatusCode)
+	}
 	var s statusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
 		return nil, err
@@ -54,8 +57,9 @@ var (
 )
 
 type statusMsg struct {
-	s   *statusResponse
-	err error
+	s      *statusResponse
+	err    error
+	rescan bool
 }
 
 type tickMsg time.Time
@@ -67,14 +71,14 @@ func tickCmd() tea.Cmd {
 func fetchCmd(control string) tea.Cmd {
 	return func() tea.Msg {
 		s, err := fetchControlJSON(fmt.Sprintf("http://%s/status", control), http.MethodGet)
-		return statusMsg{s, err}
+		return statusMsg{s: s, err: err}
 	}
 }
 
 func rescanCmd(control string) tea.Cmd {
 	return func() tea.Msg {
 		s, err := fetchControlJSON(fmt.Sprintf("http://%s/rescan", control), http.MethodPost)
-		return statusMsg{s, err}
+		return statusMsg{s: s, err: err, rescan: true}
 	}
 }
 
@@ -106,7 +110,9 @@ func (m menuModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		return m, tea.Batch(fetchCmd(m.control), tickCmd())
 	case statusMsg:
-		m.rescanning = false
+		if msg.rescan {
+			m.rescanning = false
+		}
 		m.updatedAt = time.Now()
 		if msg.err != nil {
 			m.err = msg.err

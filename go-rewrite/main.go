@@ -43,16 +43,22 @@ func main() {
 			installNfqws(os.Args[2:])
 			return
 		case "serve":
-			runDaemon(os.Args[2:])
+			if err := runDaemon(os.Args[2:]); err != nil {
+				log.Printf("daemon: %v", err)
+				os.Exit(1)
+			}
 			return
 		default:
 			log.Fatalf("неизвестная подкоманда %q (ожидалось: serve, status, rescan, menu, install-nfqws, version)", os.Args[1])
 		}
 	}
-	runDaemon(os.Args[1:]) // без подкоманды и с флагами сразу — как раньше, для обратной совместимости
+	if err := runDaemon(os.Args[1:]); err != nil { // без подкоманды и с флагами сразу — как раньше, для обратной совместимости
+		log.Printf("daemon: %v", err)
+		os.Exit(1)
+	}
 }
 
-func runDaemon(args []string) {
+func runDaemon(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	listen := fs.String("listen", "127.0.0.1:41080", "куда слушать SOCKS5 (не боевой порт wireproxy!)")
 	control := fs.String("control", "127.0.0.1:41081", "куда слушать контрольный HTTP (/status, /rescan)")
@@ -74,15 +80,15 @@ func runDaemon(args []string) {
 	if *obfuscate {
 		sup, err := startNfqws(ctx, nfqwsConfig{bin: *nfqwsBin, queueNum: *nfqwsQueue, extraArgs: *nfqwsArgs, ports: warpPorts})
 		if err != nil {
-			log.Fatalf("-obfuscate включён, но не удалось поднять nfqws: %v", err)
+			return fmt.Errorf("-obfuscate включён, но не удалось поднять nfqws: %w", err)
 		}
 		defer sup.Stop()
 		log.Printf("nfqws: обфускация включена, очередь %d, портов %d", *nfqwsQueue, len(warpPorts))
 	}
 
-	acct, err := loadOrRegisterAccount(*accountPath, *forceRegister)
+	acct, err := loadOrRegisterAccount(ctx, *accountPath, *forceRegister)
 	if err != nil {
-		log.Fatalf("%v", err)
+		return err
 	}
 	log.Printf("аккаунт готов: v4=%s v6=%s", acct.addr4, acct.addr6)
 
@@ -103,10 +109,10 @@ func runDaemon(args []string) {
 		if winner != nil {
 			winner.Close()
 		}
-		return
+		return nil
 	}
 	if winner == nil {
-		log.Fatalf("ни один кандидат не прошёл проверку, дальше запускаться некуда")
+		return fmt.Errorf("ни один кандидат не прошёл проверку, дальше запускаться некуда")
 	}
 	log.Printf("победитель первичной гонки: %s", winner.endpoint)
 
@@ -117,14 +123,14 @@ func runDaemon(args []string) {
 
 	socksLn, err := listenWithRetry(ctx, *listen)
 	if err != nil {
-		log.Fatalf("не удалось слушать SOCKS5 на %s: %v", *listen, err)
+		return fmt.Errorf("не удалось слушать SOCKS5 на %s: %w", *listen, err)
 	}
 	defer socksLn.Close()
 	go serveSOCKS5(socksLn, &active)
 
 	controlLn, err := listenWithRetry(ctx, *control)
 	if err != nil {
-		log.Fatalf("не удалось слушать control на %s: %v", *control, err)
+		return fmt.Errorf("не удалось слушать control на %s: %w", *control, err)
 	}
 	defer controlLn.Close()
 	go serveControl(controlLn, d)
@@ -147,6 +153,7 @@ func runDaemon(args []string) {
 
 	log.Printf("закрываю активный туннель и выхожу")
 	active.Load().Close()
+	return nil
 }
 
 // listenWithRetry — защита от гонки на systemctl restart: старый процесс ещё

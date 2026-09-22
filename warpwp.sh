@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.3.7"
+VERSION="1.3.8"
 REPO_SLUG="kuzzrus/WARP_WireProxy_Manager"
 GITHUB_API="https://api.github.com/repos/$REPO_SLUG"
 RELEASE_DOWNLOAD_BASE="https://github.com/$REPO_SLUG/releases/download"
@@ -196,38 +196,42 @@ ask_timer_minutes() {
   echo "$input"
 }
 
-install_manager() { acquire_admin_lock; update_local_scripts "${1:-}"; ok "Готово. Теперь меню запускается командой: warpwp"; }
+install_manager() { acquire_admin_lock || return 1; update_local_scripts "${1:-}" || return 1; ok "Готово. Теперь меню запускается командой: warpwp"; }
 update_local_scripts() (
-  acquire_admin_lock
-  need_curl
-  install_release_verifier
-  local requested_tag="${1:-}" release_tag native_stage manager_stage native_backup manager_backup manifest signature allowed_signers had_native=0 had_manager=0
+  local requested_tag="${1:-}" release_tag native_stage manager_stage native_backup manager_backup manifest signature allowed_signers had_native=0 had_manager=0 preserve_backups=0 rollback_failed=0
+  acquire_admin_lock || return 1
+  need_curl || return 1
+  install_release_verifier || return 1
   release_tag="$(resolve_release_tag "$requested_tag")" || return 1
-  mkdir -p "$(dirname "$NATIVE_BIN")" "$(dirname "$MANAGER_BIN")"
-  native_stage="$(mktemp "${NATIVE_BIN}.new.XXXXXX")"
-  manager_stage="$(mktemp "${MANAGER_BIN}.new.XXXXXX")"
-  native_backup="$(mktemp "${NATIVE_BIN}.bak.XXXXXX")"
-  manager_backup="$(mktemp "${MANAGER_BIN}.bak.XXXXXX")"
-  manifest="$(mktemp "${MANAGER_BIN}.manifest.XXXXXX")"
-  signature="$(mktemp "${MANAGER_BIN}.manifest-signature.XXXXXX")"
-  allowed_signers="$(mktemp "${MANAGER_BIN}.allowed-signers.XXXXXX")"
-  trap 'rm -f -- "$native_stage" "$manager_stage" "$native_backup" "$manager_backup" "$manifest" "$signature" "$allowed_signers"' EXIT
+  mkdir -p "$(dirname "$NATIVE_BIN")" "$(dirname "$MANAGER_BIN")" || return 1
+  native_stage="$(mktemp "${NATIVE_BIN}.new.XXXXXX")" || return 1
+  manager_stage="$(mktemp "${MANAGER_BIN}.new.XXXXXX")" || return 1
+  native_backup="$(mktemp "${NATIVE_BIN}.bak.XXXXXX")" || return 1
+  manager_backup="$(mktemp "${MANAGER_BIN}.bak.XXXXXX")" || return 1
+  manifest="$(mktemp "${MANAGER_BIN}.manifest.XXXXXX")" || return 1
+  signature="$(mktemp "${MANAGER_BIN}.manifest-signature.XXXXXX")" || return 1
+  allowed_signers="$(mktemp "${MANAGER_BIN}.allowed-signers.XXXXXX")" || return 1
+  trap 'rm -f -- "$native_stage" "$manager_stage" "$manifest" "$signature" "$allowed_signers"; [[ "$preserve_backups" == "1" ]] || rm -f -- "$native_backup" "$manager_backup"' EXIT
   log "Получаю подписанный manifest release $release_tag..."
-  download_release_manifest "$release_tag" "$manifest" "$signature" "$allowed_signers"
+  download_release_manifest "$release_tag" "$manifest" "$signature" "$allowed_signers" || return 1
   log "Загружаю и сверяю native-скрипт из $release_tag..."
-  stage_release_asset "$release_tag" warp-wireproxy-native.sh "$manifest" "$native_stage"
+  stage_release_asset "$release_tag" warp-wireproxy-native.sh "$manifest" "$native_stage" || return 1
   log "Загружаю и сверяю менеджер из $release_tag..."
-  stage_release_asset "$release_tag" warpwp.sh "$manifest" "$manager_stage"
-  if [[ -e "$NATIVE_BIN" || -L "$NATIVE_BIN" ]]; then cp -p -- "$NATIVE_BIN" "$native_backup"; had_native=1; fi
-  if [[ -e "$MANAGER_BIN" || -L "$MANAGER_BIN" ]]; then cp -p -- "$MANAGER_BIN" "$manager_backup"; had_manager=1; fi
+  stage_release_asset "$release_tag" warpwp.sh "$manifest" "$manager_stage" || return 1
+  chmod 0755 "$native_stage" "$manager_stage" || return 1
+  if [[ -e "$NATIVE_BIN" || -L "$NATIVE_BIN" ]]; then cp -p -- "$NATIVE_BIN" "$native_backup" || return 1; had_native=1; fi
+  if [[ -e "$MANAGER_BIN" || -L "$MANAGER_BIN" ]]; then cp -p -- "$MANAGER_BIN" "$manager_backup" || return 1; had_manager=1; fi
   if ! mv -f -- "$native_stage" "$NATIVE_BIN"; then err "Не удалось установить native-скрипт."; return 1; fi
   if ! mv -f -- "$manager_stage" "$MANAGER_BIN"; then
     err "Не удалось установить менеджер; откатываю обновление."
-    if [[ "$had_native" == "1" ]]; then mv -f -- "$native_backup" "$NATIVE_BIN"; else rm -f -- "$NATIVE_BIN"; fi
-    if [[ "$had_manager" == "1" ]]; then mv -f -- "$manager_backup" "$MANAGER_BIN"; else rm -f -- "$MANAGER_BIN"; fi
+    if [[ "$had_native" == "1" ]]; then mv -f -- "$native_backup" "$NATIVE_BIN" || rollback_failed=1; else rm -f -- "$NATIVE_BIN" || rollback_failed=1; fi
+    if [[ "$had_manager" == "1" ]]; then mv -f -- "$manager_backup" "$MANAGER_BIN" || rollback_failed=1; fi
+    if [[ "$rollback_failed" == "1" ]]; then
+      preserve_backups=1
+      err "Откат обновления выполнен не полностью; резервные копии сохранены рядом с целевыми файлами (*.bak.*)."
+    fi
     return 1
   fi
-  chmod 0755 "$NATIVE_BIN" "$MANAGER_BIN"
   ok "Обновлены из проверенного release $release_tag: $NATIVE_BIN и $MANAGER_BIN"
 )
 restart_updated_manager() { [[ -x "$MANAGER_BIN" ]] || { err "Не найден обновлённый менеджер: $MANAGER_BIN"; return 1; }; log "Перезапускаю менеджер из обновлённого файла..."; exec "$MANAGER_BIN" "$@"; }
@@ -381,27 +385,27 @@ EOF_TIMER
   ok "Timer включён: warp-wireproxy-check.timer, интервал: ${minutes} минут"; ok "Cron отключён, чтобы не было двойного scheduler."
 }
 remove_timer_check() { need_root; remove_timer_check_quiet; ok "Systemd timer удалён. Cron не тронут."; }
-finish_install_or_update_all() { acquire_admin_lock; fix_routing --quiet; "$NATIVE_BIN"; install_cron_check; ok "Установка/обновление завершены."; print_memo_short; }
-install_or_update_all() { local mode="${1:-}"; acquire_admin_lock; update_local_scripts; if [[ "$mode" == "--cli" ]]; then restart_updated_manager --install-current; else restart_updated_manager --install-current --menu; fi; }
+finish_install_or_update_all() { acquire_admin_lock || return 1; fix_routing --quiet || return 1; "$NATIVE_BIN" || return 1; install_cron_check || return 1; ok "Установка/обновление завершены."; print_memo_short; }
+install_or_update_all() { local mode="${1:-}"; acquire_admin_lock || return 1; update_local_scripts || return 1; if [[ "$mode" == "--cli" ]]; then restart_updated_manager --install-current; else restart_updated_manager --install-current --menu; fi; }
 scheduler_name() { local cron_active timer_active; cron_active="$(cron_active_bool)"; timer_active="$(timer_active_bool)"; if [[ "$cron_active" == "1" && "$timer_active" == "1" ]]; then echo "both"; elif [[ "$cron_active" == "1" ]]; then echo "cron"; elif [[ "$timer_active" == "1" ]]; then echo "systemd_timer"; else echo "none"; fi; }
 scheduler_status() { echo "scheduler: $(scheduler_name)"; echo "cron installed: $(cron_installed_bool)"; echo "cron daemon: $(cron_daemon_name 2>/dev/null || echo absent)"; echo "cron active: $(cron_active_bool)"; echo "cron schedule: $(cron_schedule)"; echo "timer installed: $(timer_installed_bool)"; echo "timer active: $(timer_active_bool)"; echo "timer enabled: $(timer_enabled_bool)"; echo "timer interval minutes: $(get_timer_minutes)"; if [[ -f "$CRON_FILE" ]]; then echo; cat "$CRON_FILE"; fi; if [[ -f "$TIMER_FILE" ]]; then echo; cat "$TIMER_FILE"; fi; return 0; }
 timer_status() { scheduler_status; echo; systemctl status warp-wireproxy-check.timer --no-pager -l 2>/dev/null || true; echo; systemctl list-timers --all 'warp-wireproxy-check.timer' 2>/dev/null || true; echo; tail -n 80 "$TIMER_LOG_FILE" 2>/dev/null || true; }
 
-warp_rule_present() { ip "$1" rule show 2>/dev/null | grep -Eq 'lookup (51820|warp)([[:space:]]|$)'; }
+warp_rule_present() { ip "$1" rule show 2>/dev/null | grep -Eq 'lookup warp([[:space:]]|$)'; }
 delete_warp_rules() {
   local family="$1" attempts=0
   while warp_rule_present "$family"; do
     ((attempts+=1))
     if (( attempts > 64 )); then return 1; fi
-    ip "$family" rule del table 51820 2>/dev/null || ip "$family" rule del lookup warp 2>/dev/null || return 1
+    ip "$family" rule del lookup warp 2>/dev/null || return 1
   done
 }
 routing_danger_bool() {
   ip link show warp >/dev/null 2>&1 && return 0
   warp_rule_present -4 && return 0
   warp_rule_present -6 && return 0
-  ip -4 route show table 51820 2>/dev/null | grep -q . && return 0
-  ip -6 route show table 51820 2>/dev/null | grep -q . && return 0
+  ip -4 route show table warp 2>/dev/null | grep -q . && return 0
+  ip -6 route show table warp 2>/dev/null | grep -q . && return 0
   systemctl is-active --quiet wg-quick@warp 2>/dev/null && return 0
   systemctl is-enabled --quiet wg-quick@warp 2>/dev/null && return 0
   systemctl is-active --quiet wg-quick@wgcf 2>/dev/null && return 0
@@ -421,15 +425,19 @@ routing_guard_status() {
   echo; echo "conflicting services:"; for svc in wg-quick@warp wg-quick@wgcf warp-svc; do systemctl is-active --quiet "$svc" 2>/dev/null && echo "$svc: active" || true; systemctl is-enabled --quiet "$svc" 2>/dev/null && echo "$svc: enabled" || true; done
 }
 fix_routing() {
-  acquire_admin_lock
-  local quiet="${1:-}"
-  [[ "$quiet" == "--quiet" ]] || warn "Отключаю только системный WARP full-tunnel. wireproxy SOCKS5 не трогаю."
+  acquire_admin_lock || return 1
+  local quiet="${1:-}" force="${2:-}"
+  if [[ "$quiet" == "--force" ]]; then force="--force"; quiet=""; fi
+  if [[ "$force" != "--force" ]]; then
+    warn "Автоматическая очистка маршрутов отключена: таблица 51820 может принадлежать чужому WireGuard-туннелю. Для явного удаления только системного WARP используй: warpwp --fix-routing --force"
+    [[ "$quiet" == "--quiet" ]] || routing_guard_status
+    return 0
+  fi
+  [[ "$quiet" == "--quiet" ]] || warn "Удаляю только явно подтверждённый системный WARP. wireproxy SOCKS5 не трогаю."
   systemctl disable --now wg-quick@warp wg-quick@wgcf warp-svc 2>/dev/null || true
   ip link del warp 2>/dev/null || true
   delete_warp_rules -4 || true
   delete_warp_rules -6 || true
-  ip -4 route flush table 51820 2>/dev/null || true
-  ip -6 route flush table 51820 2>/dev/null || true
   ip -4 route flush table warp 2>/dev/null || true
   ip -6 route flush table warp 2>/dev/null || true
   if routing_danger_bool; then err "Не удалось полностью убрать системную WARP-маршрутизацию."; [[ "$quiet" == "--quiet" ]] || routing_guard_status; return 1; fi
@@ -560,12 +568,12 @@ acquire_maintenance_locks() {
   ensure_flock
   command -v flock >/dev/null 2>&1 || { err "flock required for safe removal."; return 1; }
   exec {CHECK_LOCK_FD}>"$LOCK_FILE"
-  if ! flock -w 15 -E 75 "$CHECK_LOCK_FD"; then
+  if flock -w 15 -E 75 "$CHECK_LOCK_FD"; then :; else
     rc=$?; err "Проверка WARP ещё выполняется. Удаление отменено; повтори через несколько секунд."; return "$rc"
   fi
   exec {NATIVE_LOCK_FD}>"$NATIVE_LOCK_FILE"
-  if ! flock -w 15 -E 75 "$NATIVE_LOCK_FD"; then
-    rc=$?; flock -u "$CHECK_LOCK_FD" || true; err "Native-скрипт ещё выполняется. Удаление отменено; повтори позже."; return "$rc"
+  if flock -w 15 -E 75 "$NATIVE_LOCK_FD"; then :; else
+    rc=$?; flock -u "$CHECK_LOCK_FD" || true; exec {CHECK_LOCK_FD}>&-; err "Native-скрипт ещё выполняется. Удаление отменено; повтори позже."; return "$rc"
   fi
 }
 
@@ -627,7 +635,7 @@ purge_all() {
   systemctl stop warp-wireproxy-check.service 2>/dev/null || true
   remove_cron_check
   acquire_maintenance_locks || return $?
-  fix_routing --quiet || { release_maintenance_locks; return 1; }
+  fix_routing --quiet --force || { release_maintenance_locks; return 1; }
   systemctl stop wireproxy warp-svc wg-quick@warp wg-quick@wgcf 2>/dev/null || true
   systemctl disable wireproxy warp-svc wg-quick@warp wg-quick@wgcf 2>/dev/null || true
   pkill -x wireproxy 2>/dev/null || true
@@ -715,7 +723,8 @@ warpwp --scheduler-status # какой scheduler активен
 warpwp --status           # состояние
 warpwp --status-json      # JSON-статус
 warpwp --doctor           # диагностика + routing guard
-warpwp --fix-routing      # убрать опасный системный WARP full-tunnel, wireproxy не трогает
+warpwp --fix-routing      # показать безопасную диагностику системного WARP
+warpwp --fix-routing --force # явно удалить legacy system-WARP, не трогая table 51820
 warpwp --check            # scan-count=$DEFAULT_SCAN_COUNT
 warpwp --quick-scan       # scan-count=$QUICK_SCAN_COUNT
 warpwp --deep-scan        # scan-count=$DEEP_SCAN_COUNT
@@ -755,7 +764,7 @@ menu() { while true; do clear || true; echo "WARP + wireproxy manager v$VERSION"
 20) Fix routing / убрать системный WARP full-tunnel
 0) Выход
 EOF_MENU
-read -rp "Выбери пункт: " choice; case "$choice" in 1) install_or_update_all; pause ;; 2) status; pause ;; 3) repair_endpoint; pause ;; 4) update_local_scripts; restart_updated_manager ;; 5) remove_safe; pause ;; 6) show_logs; pause ;; 7) print_commands; pause ;; 8) print_memo_full; pause ;; 9) doctor; pause ;; 10) purge_all; pause ;; 11) install_cron_check; pause ;; 12) print_xray; pause ;; 13) quick_scan; pause ;; 14) deep_scan; pause ;; 15) status_json; pause ;; 16) install_timer_check; pause ;; 17) timer_status; pause ;; 18) remove_timer_check; pause ;; 19) scheduler_status; pause ;; 20) fix_routing; pause ;; 0) exit 0 ;; *) echo "Неверный пункт"; sleep 1 ;; esac; done; }
+read -rp "Выбери пункт: " choice; case "$choice" in 1) install_or_update_all; pause ;; 2) status; pause ;; 3) repair_endpoint; pause ;; 4) update_local_scripts; restart_updated_manager ;; 5) remove_safe; pause ;; 6) show_logs; pause ;; 7) print_commands; pause ;; 8) print_memo_full; pause ;; 9) doctor; pause ;; 10) purge_all; pause ;; 11) install_cron_check; pause ;; 12) print_xray; pause ;; 13) quick_scan; pause ;; 14) deep_scan; pause ;; 15) status_json; pause ;; 16) install_timer_check; pause ;; 17) timer_status; pause ;; 18) remove_timer_check; pause ;; 19) scheduler_status; pause ;; 20) fix_routing --force; pause ;; 0) exit 0 ;; *) echo "Неверный пункт"; sleep 1 ;; esac; done; }
 
 main() {
   case "${1:-}" in
@@ -771,7 +780,7 @@ main() {
     --status) status ;;
     --status-json|--json) status_json ;;
     --doctor) doctor ;;
-    --fix-routing|--routing-fix) fix_routing ;;
+    --fix-routing|--routing-fix) fix_routing "${2:-}" "${3:-}" ;;
     --check|--repair) shift; repair_endpoint "$@" ;;
     --quick-scan|--quick) shift; quick_scan "$@" ;;
     --deep-scan|--deep) shift; deep_scan "$@" ;;

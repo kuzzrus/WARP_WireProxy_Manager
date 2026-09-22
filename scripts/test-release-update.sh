@@ -65,4 +65,14 @@ expect_true "pair update from signed release" update_local_scripts v1.3.4
 cmp -s "$asset_dir/warp-wireproxy-native.sh" "$NATIVE_BIN" || fail "installed native asset"
 cmp -s "$asset_dir/warpwp.sh" "$MANAGER_BIN" || fail "installed manager asset"
 
+# update_local_scripts is also called in an `if`/`||` context by the manager.
+# A failed signature must still return non-zero and leave both installed files
+# byte-for-byte unchanged in that Bash corner case.
+cp "$NATIVE_BIN" "$tmp_dir/native.before-invalid-signature"
+cp "$MANAGER_BIN" "$tmp_dir/manager.before-invalid-signature"
+printf '%s\n' 'invalid signature' > "$asset_dir/SHA256SUMS.sig"
+if update_local_scripts v1.3.4; then fail "invalid signature must reject the full update"; fi
+cmp -s "$NATIVE_BIN" "$tmp_dir/native.before-invalid-signature" || fail "invalid signature changed native script"
+cmp -s "$MANAGER_BIN" "$tmp_dir/manager.before-invalid-signature" || fail "invalid signature changed manager script"
+
 printf '[OK] signed release manifest tests completed\n'

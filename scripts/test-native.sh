@@ -230,4 +230,44 @@ SOCKS_HOST="0.0.0.0"; SOCKS_PORT="40123"
 SOCKS_HOST="[::1]"
 [[ "$(socks_proxy_url)" == "socks5h://[::1]:40123" ]] || fail "IPv6 proxy URL must be bracketed"
 
+# A failed registration backup must never remove the current account/key pair.
+REG_DIR="$tmp_dir/registration"
+mkdir -p "$REG_DIR"
+WG_DIR="$REG_DIR"
+ACCOUNT_JSON="$REG_DIR/warp-account.json"
+PRIVATE_KEY_FILE="$REG_DIR/warp-private.key"
+TMP_DIR="$tmp_dir"
+printf '%s\n' 'old-private-key' > "$PRIVATE_KEY_FILE"
+printf '%s\n' '{"old":"account"}' > "$ACCOUNT_JSON"
+command cp "$PRIVATE_KEY_FILE" "$tmp_dir/original-private.key"
+command cp "$ACCOUNT_JSON" "$tmp_dir/original-account.json"
+FORCE_REGISTER="1"
+wg() { case "$1" in genkey) printf '%s\n' 'new-private-key' ;; pubkey) printf '%s\n' 'new-public-key' ;; esac; }
+curl() { printf '%s\n' '{"new":"account"}'; }
+validate_account_pair() { return 0; }
+cp() { return 1; }
+if register_warp_account >/dev/null 2>&1; then fail "registration must stop when backup fails"; fi
+cmp -s "$PRIVATE_KEY_FILE" "$tmp_dir/original-private.key" || fail "failed backup must preserve private key"
+cmp -s "$ACCOUNT_JSON" "$tmp_dir/original-account.json" || fail "failed backup must preserve account"
+
+# The full install transaction restores every managed file before returning an
+# error to the caller. The test avoids systemd and the real /root backup path.
+unset -f cp wg curl validate_account_pair
+INSTALL_BACKUP_ROOT="$tmp_dir/install-backups"
+WARP_CONF="$REG_DIR/warp.wireproxy.conf"
+LEGACY_WARP_CONF="$REG_DIR/warp.conf"
+PROXY_CONF="$REG_DIR/proxy.conf"
+GOOD_ENDPOINTS_FILE="$REG_DIR/good"
+BAD_ENDPOINTS_FILE="$REG_DIR/bad"
+SERVICE_FILE="$REG_DIR/wireproxy.service"
+for managed in "$WARP_CONF" "$LEGACY_WARP_CONF" "$PROXY_CONF" "$ACCOUNT_JSON" "$PRIVATE_KEY_FILE" "$GOOD_ENDPOINTS_FILE" "$BAD_ENDPOINTS_FILE" "$SERVICE_FILE"; do
+  printf 'original:%s\n' "$(basename "$managed")" > "$managed"
+  command cp "$managed" "$managed.before"
+done
+systemctl() { return 0; }
+begin_install_transaction || fail "begin install transaction"
+for managed in "$WARP_CONF" "$LEGACY_WARP_CONF" "$PROXY_CONF" "$ACCOUNT_JSON" "$PRIVATE_KEY_FILE" "$GOOD_ENDPOINTS_FILE" "$BAD_ENDPOINTS_FILE" "$SERVICE_FILE"; do printf 'changed\n' > "$managed"; done
+rollback_install_transaction || fail "rollback install transaction"
+for managed in "$WARP_CONF" "$LEGACY_WARP_CONF" "$PROXY_CONF" "$ACCOUNT_JSON" "$PRIVATE_KEY_FILE" "$GOOD_ENDPOINTS_FILE" "$BAD_ENDPOINTS_FILE" "$SERVICE_FILE"; do cmp -s "$managed" "$managed.before" || fail "rollback must restore $(basename "$managed")"; done
+
 printf '[OK] native policy/stability/cache tests completed\n'

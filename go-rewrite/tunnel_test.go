@@ -42,3 +42,21 @@ func TestPickFastestEmpty(t *testing.T) {
 		t.Fatalf("got %d, want -1 для пустого входа", got)
 	}
 }
+
+func TestRetiredTunnelWaitsForBorrowedConnection(t *testing.T) {
+	tn := &tunnel{endpoint: "old:1"}
+	if !tn.Borrow() {
+		t.Fatal("fresh tunnel must accept a connection")
+	}
+	tn.Retire()
+	if tn.closed {
+		t.Fatal("retired tunnel with an active SOCKS connection must stay open")
+	}
+	if tn.Borrow() {
+		t.Fatal("retired tunnel must not accept new SOCKS connections")
+	}
+	tn.Release()
+	if !tn.closed {
+		t.Fatal("retired tunnel must close after its last SOCKS connection")
+	}
+}

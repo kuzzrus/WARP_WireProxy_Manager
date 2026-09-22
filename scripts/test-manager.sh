@@ -68,4 +68,25 @@ flock() { [[ "${1:-}" == "-n" ]] && return 75; return 0; }
 if run_scan 1 test >/dev/null 2>&1; then fail "busy scan lock must fail"; else rc=$?; fi
 [[ "$rc" == "75" ]] || fail "busy scan lock must return code 75"
 
+# Removal must stop before any destructive action when either maintenance lock
+# is busy; `if ! flock; rc=$?` used to turn the 75 into a false success.
+NATIVE_LOCK_FILE="$tmp_dir/native.lock"
+ensure_flock() { :; }
+flock() { [[ "${1:-}" == "-w" ]] && return 75; return 0; }
+if acquire_maintenance_locks >/dev/null 2>&1; then fail "busy maintenance lock must fail"; else rc=$?; fi
+[[ "$rc" == "75" ]] || fail "busy maintenance lock must return code 75"
+
+# Even explicitly cleaning legacy system WARP must never flush numeric table
+# 51820: wg-quick may have assigned it to an unrelated wg0 tunnel.
+acquire_admin_lock() { :; }
+TABLE_51820_FLUSHED=0
+systemctl() { return 1; }
+ip() {
+  if [[ "$*" == *'route flush table 51820'* ]]; then TABLE_51820_FLUSHED=1; fi
+  if [[ "${2:-}" == "link" ]]; then return 1; fi
+  return 0
+}
+fix_routing --force >/dev/null 2>&1 || fail "explicit routing cleanup mock"
+[[ "$TABLE_51820_FLUSHED" == "0" ]] || fail "routing cleanup must not flush foreign table 51820"
+
 printf '[OK] manager scheduler/config/lock tests completed\n'

@@ -17,11 +17,15 @@ func serveControl(ln net.Listener, d *daemon) {
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		t := d.active.Load()
+		endpoint := ""
+		if t != nil {
+			endpoint = t.endpoint
+		}
 		lastCheck, healthy, lastErr, raceTook, switches := d.state.snapshot()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"version":         version,
-			"active_endpoint": t.endpoint,
+			"active_endpoint": endpoint,
 			"last_check":      lastCheck,
 			"last_healthy":    healthy,
 			"last_error":      lastErr,
@@ -37,7 +41,12 @@ func serveControl(ln net.Listener, d *daemon) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), d.probeTimeout+10*time.Second)
 		defer cancel()
-		d.checkAndHeal(ctx, true)
+		if err := d.checkAndHeal(ctx, true); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
 		t := d.active.Load()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"active_endpoint": t.endpoint})

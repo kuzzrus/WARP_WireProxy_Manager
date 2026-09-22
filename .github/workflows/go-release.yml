@@ -61,17 +61,23 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
 
+      - name: Add matching systemd unit
+        run: cp go-rewrite/warpwp-go.service release-assets/warpwp-go.service
+
       - name: Checksums
         working-directory: release-assets
         run: |
           chmod 755 warpwp-go-linux-*
-          sha256sum warpwp-go-linux-* > SHA256SUMS
+          sha256sum warpwp-go-linux-* warpwp-go.service > SHA256SUMS
 
       - name: Publish GitHub Release
         env:
