@@ -10,12 +10,15 @@ import (
 	"net/http"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
+
+var warpSocketFwmark atomic.Uint32
 
 // netDialer — то немногое, что нужно от netstack.Net остальному коду.
 // Интерфейс, а не конкретный *netstack.Net, специально: тесты SOCKS5 и
@@ -115,6 +118,9 @@ func dialTunnel(acct *account, endpoint string) (*tunnel, error) {
 		"private_key=%s\npublic_key=%s\nendpoint=%s\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\npersistent_keepalive_interval=25\n",
 		acct.privHex, acct.peerPubHex, endpoint,
 	)
+	if fwmark := warpSocketFwmark.Load(); fwmark != 0 {
+		uapi += fmt.Sprintf("fwmark=%d\n", fwmark)
+	}
 	if err := dev.IpcSet(uapi); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("IpcSet: %w", err)

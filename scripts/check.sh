@@ -41,6 +41,7 @@ echo "== Unit tests =="
 bash scripts/test-native.sh
 bash scripts/test-manager.sh
 bash scripts/test-release-update.sh
+bash scripts/test-standalone-installer.sh
 
 echo
 printf '[OK] checks completed\n'

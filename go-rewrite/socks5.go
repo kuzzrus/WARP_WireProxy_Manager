@@ -7,25 +7,42 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
+	"time"
+)
+
+const (
+	socksHandshakeTimeout = 30 * time.Second
+	socksDialTimeout      = 30 * time.Second
+	socksIdleTimeout      = 10 * time.Minute
 )
 
 // Минимальный SOCKS5: без аутентификации, только CONNECT (RFC 1928). Этого
 // достаточно для Xray-outbound, который сейчас смотрит на wireproxy так же.
-func serveSOCKS5(ln net.Listener, active *atomic.Pointer[tunnel]) {
+func serveSOCKS5(ctx context.Context, ln net.Listener, active *atomic.Pointer[tunnel]) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			log.Printf("socks5: accept: %v", err)
 			return
 		}
-		go handleSOCKS5Conn(c, active)
+		go handleSOCKS5ConnContext(ctx, c, active)
 	}
 }
 
 func handleSOCKS5Conn(c net.Conn, active *atomic.Pointer[tunnel]) {
+	handleSOCKS5ConnContext(context.Background(), c, active)
+}
+
+func handleSOCKS5ConnContext(ctx context.Context, c net.Conn, active *atomic.Pointer[tunnel]) {
 	defer c.Close()
+	stopHandshakeCancellation := closeConnectionsOnContext(ctx, c)
+	defer stopHandshakeCancellation()
 	buf := make([]byte, 262)
+	if err := c.SetDeadline(time.Now().Add(socksHandshakeTimeout)); err != nil {
+		return
+	}
 
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
 		return
@@ -101,23 +118,34 @@ func handleSOCKS5Conn(c net.Conn, active *atomic.Pointer[tunnel]) {
 		return
 	}
 	defer t.Release()
-	remote, err := t.tnet.DialContext(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	dialCtx, cancelDial := context.WithTimeout(ctx, socksDialTimeout)
+	remote, err := t.tnet.DialContext(dialCtx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	cancelDial()
 	if err != nil {
 		writeSOCKS5Reply(c, 0x05)
 		return
 	}
 	defer remote.Close()
-	writeSOCKS5Reply(c, 0x00)
+	stopHandshakeCancellation()
+	stopRelayCancellation := closeConnectionsOnContext(ctx, c, remote)
+	defer stopRelayCancellation()
+	if err := writeSOCKS5Reply(c, 0x00); err != nil {
+		return
+	}
+	clientRelay, remoteRelay, err := newIdleTimeoutPair(c, remote, socksIdleTimeout)
+	if err != nil {
+		return
+	}
 
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(remote, c)
-		closeWrite(remote)
+		_, _ = io.Copy(remoteRelay, clientRelay)
+		closeWrite(remoteRelay)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(c, remote)
-		closeWrite(c)
+		_, _ = io.Copy(clientRelay, remoteRelay)
+		closeWrite(clientRelay)
 		done <- struct{}{}
 	}()
 	// A single io.Copy finishing only means one side half-closed its stream.
@@ -127,12 +155,84 @@ func handleSOCKS5Conn(c net.Conn, active *atomic.Pointer[tunnel]) {
 	<-done
 }
 
+func closeConnectionsOnContext(ctx context.Context, conns ...net.Conn) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			for _, conn := range conns {
+				_ = conn.Close()
+			}
+		case <-stop:
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
+	}
+}
+
+type idleDeadlineGroup struct {
+	timeout time.Duration
+	conns   []net.Conn
+}
+
+func (g *idleDeadlineGroup) refresh() error {
+	deadline := time.Now().Add(g.timeout)
+	for _, conn := range g.conns {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type idleTimeoutConn struct {
+	net.Conn
+	deadlines *idleDeadlineGroup
+}
+
+func newIdleTimeoutPair(left, right net.Conn, timeout time.Duration) (*idleTimeoutConn, *idleTimeoutConn, error) {
+	deadlines := &idleDeadlineGroup{timeout: timeout, conns: []net.Conn{left, right}}
+	if err := deadlines.refresh(); err != nil {
+		return nil, nil, err
+	}
+	return &idleTimeoutConn{Conn: left, deadlines: deadlines}, &idleTimeoutConn{Conn: right, deadlines: deadlines}, nil
+}
+
+func (c *idleTimeoutConn) Read(p []byte) (int, error) {
+	if err := c.deadlines.refresh(); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(p)
+}
+
+func (c *idleTimeoutConn) Write(p []byte) (int, error) {
+	if err := c.deadlines.refresh(); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *idleTimeoutConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
 func closeWrite(c net.Conn) {
 	if cw, ok := c.(interface{ CloseWrite() error }); ok {
 		_ = cw.CloseWrite()
 	}
 }
 
-func writeSOCKS5Reply(c net.Conn, rep byte) {
-	c.Write([]byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+func writeSOCKS5Reply(c net.Conn, rep byte) error {
+	_, err := c.Write([]byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	return err
 }

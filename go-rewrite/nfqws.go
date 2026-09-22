@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,7 +17,11 @@ import (
 // ровно та же логика, что и ZAPRET_PORTS/zapret4rocket в bash-версии, только
 // сама nftables-очередь и процесс nfqws теперь поднимает и следит за ними
 // демон, а не сторонняя ручная настройка.
-const nfqwsTableName = "warpwp_nfqws"
+const (
+	nfqwsTableName         = "warpwp_nfqws"
+	defaultNfqwsDesyncMark = uint32(0x40000000)
+	defaultWarpSocketMark  = uint32(0x20000000)
+)
 
 // fakeWireguardInitiationHex — официальный fake-пакет из zapret
 // (files/fake/wireguard_initiation.bin), 148 байт — ровно размер настоящего
@@ -37,15 +42,17 @@ const fakeWireguardInitiationHex = "01000000053fa03f793219e2b0c19463809a368eca4b
 // это только приманка для DPI на пути), настоящий пакет при этом не
 // модифицируется вообще.
 var defaultNfqwsStrategy = fmt.Sprintf(
-	"--filter-l7=wireguard --dpi-desync=fake --dpi-desync-fake-wireguard=0x%s --dpi-desync-ttl=3 --dpi-desync-repeats=6",
-	fakeWireguardInitiationHex,
+	"--filter-l7=wireguard --dpi-desync=fake --dpi-desync-fake-wireguard=0x%s --dpi-desync-fwmark=0x%x --dpi-desync-ttl=3 --dpi-desync-repeats=6",
+	fakeWireguardInitiationHex, defaultNfqwsDesyncMark,
 )
 
 type nfqwsConfig struct {
-	bin       string
-	queueNum  int
-	extraArgs string
-	ports     []int
+	bin        string
+	queueNum   int
+	extraArgs  string
+	ports      []int
+	desyncMark uint32
+	socketMark uint32
 }
 
 type nfqwsSupervisor struct {
@@ -81,8 +88,77 @@ func portSetTokens(ports []int) []string {
 	return toks
 }
 
-// setupNfqwsQueue создаёт свою изолированную nftables-таблицу с единственным
-// правилом: исходящий UDP на WARP-порты идёт в очередь nfqws. bypass
+func stringSetTokens(values []string) []string {
+	toks := make([]string, 0, len(values)+2)
+	toks = append(toks, "{")
+	for i, value := range values {
+		if i < len(values)-1 {
+			toks = append(toks, value+",")
+		} else {
+			toks = append(toks, value)
+		}
+	}
+	toks = append(toks, "}")
+	return toks
+}
+
+func warpPrefixCIDRs() []string {
+	cidrs := make([]string, 0, len(warpPrefixes))
+	for _, prefix := range warpPrefixes {
+		cidrs = append(cidrs, prefix+".0/24")
+	}
+	return cidrs
+}
+
+func prepareNfqwsArgs(extraArgs string, expectedMark uint32) (string, error) {
+	tokens := strings.Fields(extraArgs)
+	found := false
+	for _, token := range tokens {
+		const prefix = "--dpi-desync-fwmark="
+		if !strings.HasPrefix(token, prefix) {
+			continue
+		}
+		if found {
+			return "", fmt.Errorf("--dpi-desync-fwmark указан больше одного раза")
+		}
+		value, err := strconv.ParseUint(strings.TrimPrefix(token, prefix), 0, 32)
+		if err != nil {
+			return "", fmt.Errorf("неверный --dpi-desync-fwmark: %w", err)
+		}
+		if uint32(value) != expectedMark {
+			return "", fmt.Errorf("--dpi-desync-fwmark=0x%x не совпадает с -nfqws-fwmark=0x%x", value, expectedMark)
+		}
+		found = true
+	}
+	if !found {
+		tokens = append(tokens, fmt.Sprintf("--dpi-desync-fwmark=0x%x", expectedMark))
+	}
+	return strings.Join(tokens, " "), nil
+}
+
+func nfqwsMarkExclusionRuleArgs(cfg nfqwsConfig) []string {
+	return []string{
+		"add", "rule", "inet", nfqwsTableName, "output",
+		"meta", "mark", "&", fmt.Sprintf("0x%x", cfg.desyncMark), "!=", "0", "return",
+	}
+}
+
+func nfqwsQueueRuleArgs(cfg nfqwsConfig) []string {
+	args := []string{
+		"add", "rule", "inet", nfqwsTableName, "output",
+		"meta", "mark", "&", fmt.Sprintf("0x%x", cfg.socketMark), "!=", "0",
+		"ip", "daddr",
+	}
+	args = append(args, stringSetTokens(warpPrefixCIDRs())...)
+	args = append(args, "udp", "dport")
+	args = append(args, portSetTokens(cfg.ports)...)
+	args = append(args, "queue", "num", fmt.Sprintf("%d", cfg.queueNum), "bypass")
+	return args
+}
+
+// setupNfqwsQueue создаёт свою изолированную nftables-таблицу. В очередь
+// попадают только помеченные сокеты этого WARP-демона, адреса WARP и нужные
+// UDP-порты. Fake-пакеты nfqws исключаются по отдельной mark-маске. bypass
 // обязателен — если nfqws не запущен или упал, пакеты идут как обычно, а не
 // теряются в никуда.
 func setupNfqwsQueue(cfg nfqwsConfig) error {
@@ -94,10 +170,11 @@ func setupNfqwsQueue(cfg nfqwsConfig) error {
 		teardownNfqwsQueue()
 		return err
 	}
-	args := []string{"add", "rule", "inet", nfqwsTableName, "output", "udp", "dport"}
-	args = append(args, portSetTokens(cfg.ports)...)
-	args = append(args, "queue", "num", fmt.Sprintf("%d", cfg.queueNum), "bypass")
-	if err := runNft(args...); err != nil {
+	if err := runNft(nfqwsMarkExclusionRuleArgs(cfg)...); err != nil {
+		teardownNfqwsQueue()
+		return err
+	}
+	if err := runNft(nfqwsQueueRuleArgs(cfg)...); err != nil {
 		teardownNfqwsQueue()
 		return err
 	}
@@ -114,6 +191,11 @@ func startNfqws(ctx context.Context, cfg nfqwsConfig) (*nfqwsSupervisor, error) 
 	if _, err := exec.LookPath(cfg.bin); err != nil {
 		return nil, fmt.Errorf("nfqws бинарник %q не найден в PATH — поставь его: warpwp-go install-nfqws (или вручную из https://github.com/bol-van/zapret): %w", cfg.bin, err)
 	}
+	preparedArgs, err := prepareNfqwsArgs(cfg.extraArgs, cfg.desyncMark)
+	if err != nil {
+		return nil, err
+	}
+	cfg.extraArgs = preparedArgs
 	if err := setupNfqwsQueue(cfg); err != nil {
 		return nil, fmt.Errorf("nftables: %w", err)
 	}

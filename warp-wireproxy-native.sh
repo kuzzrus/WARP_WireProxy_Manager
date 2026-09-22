@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.2.5"
+VERSION="1.2.6"
 SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="40000"
 SOCKS_HOST_EXPLICIT="0"
@@ -380,26 +380,47 @@ find_wireproxy_bin() {
   return 1
 }
 
-install_wireproxy_from_release() {
-  local arch arch_re url tmp tmpdir bin
-  arch="$(uname -m)"
-  case "$arch" in x86_64|amd64) arch_re="amd64|x86_64" ;; aarch64|arm64) arch_re="arm64|aarch64" ;; armv7l|armv7) arch_re="armv7|arm" ;; *) arch_re="$arch" ;; esac
-  log "Пытаюсь скачать wireproxy из GitHub Releases для архитектуры: $arch"
-  url="$(python3 - "$arch_re" <<'PY'
-import json, re, sys, urllib.request
-arch_re = sys.argv[1]
+select_wireproxy_release_url() {
+  local arch="$1" metadata_file="$2"
+  "${PYTHON_BIN:-python3}" - "$arch" "$metadata_file" <<'PY'
+import json, pathlib, re, sys
+
+machine = sys.argv[1].lower()
+asset_arches = {
+    "x86_64": ("amd64",),
+    "amd64": ("amd64",),
+    "aarch64": ("arm64",),
+    "arm64": ("arm64",),
+    "armv7l": ("arm", "armv7", "armv7l", "armhf"),
+    "armv7": ("arm", "armv7", "armv7l", "armhf"),
+    "armhf": ("arm", "armv7", "armv7l", "armhf"),
+}.get(machine, (machine,))
+
 try:
-    data = json.load(urllib.request.urlopen('https://api.github.com/repos/pufferffish/wireproxy/releases/latest', timeout=20))
-except Exception:
+    data = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+except (OSError, ValueError):
     sys.exit(1)
-for a in data.get('assets', []):
-    u = a.get('browser_download_url', '')
-    s = (a.get('name', '') + ' ' + u).lower()
-    if 'linux' in s and re.search(arch_re, s):
-        print(u); sys.exit(0)
+
+for asset in data.get("assets", []):
+    name = str(asset.get("name", "")).lower()
+    url = str(asset.get("browser_download_url", ""))
+    # Match the release filename's architecture component exactly.  In
+    # particular, linux_arm must never be selected by matching linux_arm64.
+    match = re.search(r"(?:^|[_-])linux[_-]([a-z0-9]+)(?:[_.-]|$)", name)
+    if match and match.group(1) in asset_arches and url:
+        print(url)
+        sys.exit(0)
 sys.exit(1)
 PY
-)" || true
+}
+
+install_wireproxy_from_release() {
+  local arch url metadata tmp tmpdir bin
+  arch="$(uname -m)"
+  log "Пытаюсь скачать wireproxy из GitHub Releases для архитектуры: $arch"
+  metadata="$TMP_DIR/wireproxy-release.json"
+  curl -fsSL --max-time 20 'https://api.github.com/repos/pufferffish/wireproxy/releases/latest' -o "$metadata" || return 1
+  url="$(select_wireproxy_release_url "$arch" "$metadata")" || true
   [[ -z "$url" ]] && return 1
   tmp="$TMP_DIR/wireproxy-download"; tmpdir="$TMP_DIR/wireproxy-extract"; mkdir -p "$tmpdir"
   curl -fL "$url" -o "$tmp"

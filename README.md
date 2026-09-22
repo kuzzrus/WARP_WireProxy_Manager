@@ -54,8 +54,8 @@ https://github.com/kuzzrus/WARP_WireProxy_Manager
 Текущая версия:
 
 ```text
-warpwp v1.3.8
-warp-wireproxy-native.sh v1.2.5
+warpwp v1.3.9
+warp-wireproxy-native.sh v1.2.6
 ```
 
 ---
@@ -67,7 +67,7 @@ warp-wireproxy-native.sh v1.2.5
 ```bash
 sudo bash <<'INSTALL_WARPWP'
 set -Eeuo pipefail
-TAG=v1.3.8
+TAG=v1.3.9
 BASE="https://github.com/kuzzrus/WARP_WireProxy_Manager/releases/download/$TAG"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TMP_DIR"' EXIT
@@ -466,7 +466,7 @@ warpwp --update
 Чтобы установить строго определённую версию:
 
 ```bash
-warpwp --update v1.3.8
+warpwp --update v1.3.9
 ```
 
 ---
@@ -611,7 +611,9 @@ INSTALL_WARPWP_GO
 
 Основные флаги `serve`: `-listen`, `-control`, `-account`, `-force-register`,
 `-check-interval`, `-random`, `-obfuscate`, `-nfqws-bin`, `-nfqws-queue`,
-`-nfqws-args`.
+`-nfqws-args`, `-nfqws-fwmark`, `-warp-fwmark`. При `-obfuscate` nftables
+пропускает в NFQUEUE только помеченные UDP-сокеты этого демона к WARP-сетям;
+метка fake-пакетов nfqws исключает их повторный заход в очередь.
 
 Управление сервисом — обычный systemd: `systemctl status|restart|stop warpwp-go`,
 логи — `journalctl -u warpwp-go -f`. Полное удаление:

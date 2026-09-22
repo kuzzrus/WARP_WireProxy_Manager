@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.3.9 — remaining P2 audit fixes (warpwp 1.3.9, native 1.2.6)
+
+- ARMv7 installs now select the exact `wireproxy_linux_arm` release asset and
+  can no longer match `arm64` by a broad substring.
+- The standalone cron installer uses the shared administrative lock, writes
+  cron atomically, and restores cron/timer files plus their prior systemd
+  enabled/active states when installation fails.
+- Go SOCKS5 sessions now have bounded handshake, dial, and idle waits and are
+  canceled during daemon shutdown without imposing a fixed lifetime on active
+  long-lived connections.
+- NFQUEUE is limited to marked sockets from this WARP daemon, WARP address
+  ranges, and WARP ports. Generated nfqws packets are excluded by an explicit
+  desync mark, and custom mark overrides are checked for compatibility.
+- Invalid or excessive numeric Go flags are rejected before tunnel allocation,
+  ticker creation, or NFQUEUE setup.
+
 ## v1.3.8 — audit hardening (warpwp 1.3.8, native 1.2.5)
 
 - The signed Bash update path now fails closed in every caller context: a bad

@@ -224,4 +224,58 @@ func TestSOCKS5RelaysResponseAfterClientHalfClose(t *testing.T) {
 	}
 }
 
+func TestIdleTimeoutConnExpiresInactiveRead(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	idle, _, err := newIdleTimeoutPair(left, right, 25*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = idle.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("inactive connection read must time out")
+	}
+	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("read error = %v, want timeout", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("idle read timeout took unexpectedly long")
+	}
+}
+
+func TestSOCKS5ContextCancellationClosesRelay(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+	remoteClientSide, remoteServerSide := net.Pipe()
+	defer remoteClientSide.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var active atomic.Pointer[tunnel]
+	active.Store(&tunnel{endpoint: "fake:1", tnet: &fakeDialer{conn: remoteServerSide}})
+	go handleSOCKS5ConnContext(ctx, serverSide, &active)
+
+	if _, err := clientSide.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(clientSide, make([]byte, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientSide.Write([]byte{0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80}); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(clientSide, reply); err != nil || reply[1] != 0x00 {
+		t.Fatalf("CONNECT reply: % x, err=%v", reply, err)
+	}
+
+	cancel()
+	_ = clientSide.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := clientSide.Read(make([]byte, 1)); err == nil {
+		t.Fatal("canceled daemon context must close active relay")
+	}
+}
+
 var errTestDial = &net.OpError{Op: "dial", Err: net.ErrClosed}

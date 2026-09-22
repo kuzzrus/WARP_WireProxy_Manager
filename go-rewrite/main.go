@@ -71,19 +71,39 @@ func runDaemon(args []string) error {
 	obfuscate := fs.Bool("obfuscate", false, "опционально: поднять nfqws (zapret) на WARP-портах для обхода DPI на плече VPS-Cloudflare")
 	nfqwsBin := fs.String("nfqws-bin", "nfqws", "путь к бинарнику nfqws")
 	nfqwsQueue := fs.Int("nfqws-queue", 20000, "номер netfilter queue для nfqws")
+	nfqwsFwmark := fs.Uint("nfqws-fwmark", uint(defaultNfqwsDesyncMark), "метка fake-пакетов nfqws (должна совпадать с --dpi-desync-fwmark)")
+	warpFwmark := fs.Uint("warp-fwmark", uint(defaultWarpSocketMark), "метка UDP-сокетов этого WARP-демона для точного nft-фильтра")
 	nfqwsArgs := fs.String("nfqws-args", defaultNfqwsStrategy, "аргументы стратегии nfqws (это рабочая стартовая точка на fake-пакете под протокол wireguard, подбирается под конкретную DPI)")
 	fs.Parse(args)
+	if err := validateDaemonNumericOptions(*randomCount, *probeTimeout, *checkInterval, *duration, *nfqwsQueue); err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if *obfuscate {
-		sup, err := startNfqws(ctx, nfqwsConfig{bin: *nfqwsBin, queueNum: *nfqwsQueue, extraArgs: *nfqwsArgs, ports: warpPorts})
+		if *nfqwsFwmark == 0 || uint64(*nfqwsFwmark) > uint64(^uint32(0)) {
+			return fmt.Errorf("-nfqws-fwmark должен быть ненулевой 32-битной меткой")
+		}
+		if *warpFwmark == 0 || uint64(*warpFwmark) > uint64(^uint32(0)) {
+			return fmt.Errorf("-warp-fwmark должен быть ненулевой 32-битной меткой")
+		}
+		if uint32(*nfqwsFwmark)&uint32(*warpFwmark) != 0 {
+			return fmt.Errorf("-nfqws-fwmark и -warp-fwmark не должны пересекаться по битам")
+		}
+		warpSocketFwmark.Store(uint32(*warpFwmark))
+		sup, err := startNfqws(ctx, nfqwsConfig{
+			bin: *nfqwsBin, queueNum: *nfqwsQueue, extraArgs: *nfqwsArgs, ports: warpPorts,
+			desyncMark: uint32(*nfqwsFwmark), socketMark: uint32(*warpFwmark),
+		})
 		if err != nil {
 			return fmt.Errorf("-obfuscate включён, но не удалось поднять nfqws: %w", err)
 		}
 		defer sup.Stop()
 		log.Printf("nfqws: обфускация включена, очередь %d, портов %d", *nfqwsQueue, len(warpPorts))
+	} else {
+		warpSocketFwmark.Store(0)
 	}
 
 	acct, err := loadOrRegisterAccount(ctx, *accountPath, *forceRegister)
@@ -126,7 +146,7 @@ func runDaemon(args []string) error {
 		return fmt.Errorf("не удалось слушать SOCKS5 на %s: %w", *listen, err)
 	}
 	defer socksLn.Close()
-	go serveSOCKS5(socksLn, &active)
+	go serveSOCKS5(ctx, socksLn, &active)
 
 	controlLn, err := listenWithRetry(ctx, *control)
 	if err != nil {
@@ -153,6 +173,25 @@ func runDaemon(args []string) error {
 
 	log.Printf("закрываю активный туннель и выхожу")
 	active.Load().Close()
+	return nil
+}
+
+func validateDaemonNumericOptions(randomCount int, probeTimeout, checkInterval, duration time.Duration, nfqwsQueue int) error {
+	if randomCount < 0 || randomCount > 256 {
+		return fmt.Errorf("-random должен быть в диапазоне 0..256 (получено %d)", randomCount)
+	}
+	if probeTimeout < 100*time.Millisecond || probeTimeout > 5*time.Minute {
+		return fmt.Errorf("-probe-timeout должен быть в диапазоне 100ms..5m (получено %s)", probeTimeout)
+	}
+	if checkInterval < time.Second || checkInterval > 24*time.Hour {
+		return fmt.Errorf("-check-interval должен быть в диапазоне 1s..24h (получено %s)", checkInterval)
+	}
+	if duration < 0 {
+		return fmt.Errorf("-duration не может быть отрицательным (получено %s)", duration)
+	}
+	if nfqwsQueue < 0 || nfqwsQueue > 65535 {
+		return fmt.Errorf("-nfqws-queue должен быть в диапазоне 0..65535 (получено %d)", nfqwsQueue)
+	}
 	return nil
 }
 
