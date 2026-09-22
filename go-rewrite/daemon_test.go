@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -136,5 +137,38 @@ func TestCheckAndHealForceSkipsProbe(t *testing.T) {
 
 	if active.Load() != winner {
 		t.Fatal("форсированный rescan должен был переключить на победителя")
+	}
+}
+
+func TestConcurrentRescansAreSerialized(t *testing.T) {
+	current := &tunnel{endpoint: "current:1"}
+	d, _ := newTestDaemon(current)
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	d.raceFn = func(context.Context, *account, []string, time.Duration) (*tunnel, []raceResult) {
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return &tunnel{endpoint: "winner:2"}, nil
+	}
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = d.checkAndHeal(context.Background(), true)
+		}()
+	}
+	wg.Wait()
+	if maxInFlight != 1 {
+		t.Fatalf("parallel rescans = %d, want exactly one", maxInFlight)
 	}
 }

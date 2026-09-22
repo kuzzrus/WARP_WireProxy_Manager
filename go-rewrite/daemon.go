@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,7 @@ type daemon struct {
 	probeTimeout time.Duration
 	randomCount  int
 	state        daemonState
+	checkMu      sync.Mutex
 
 	// Подменяемые в тестах хуки на реальные сетевые операции — по умолчанию
 	// настоящие probeTunnel/raceCandidates, тесты подставляют фейки и не
@@ -72,8 +74,19 @@ func (d *daemon) healthLoop(ctx context.Context, interval time.Duration) {
 
 // checkAndHeal — сердце демона. forceUnhealthy=true пропускает пробу
 // текущего endpoint'а и сразу пересканирует; используется ручным /rescan.
-func (d *daemon) checkAndHeal(ctx context.Context, forceUnhealthy bool) {
+func (d *daemon) checkAndHeal(ctx context.Context, forceUnhealthy bool) error {
+	// One rescan owns the active pointer from the probe through the swap. Without
+	// this lock a manual /rescan and healthLoop could race and close each other's
+	// freshly selected tunnel.
+	d.checkMu.Lock()
+	defer d.checkMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	current := d.active.Load()
+	if current == nil {
+		return fmt.Errorf("нет активного туннеля")
+	}
 	healthy := false
 	var lastErr error
 
@@ -106,7 +119,7 @@ func (d *daemon) checkAndHeal(ctx context.Context, forceUnhealthy bool) {
 
 	if healthy {
 		log.Printf("health-check: %s всё ещё жив, ничего не трогаю", current.endpoint)
-		return
+		return nil
 	}
 
 	log.Printf("health-check: %s не отвечает, пересканирую...", current.endpoint)
@@ -122,7 +135,7 @@ func (d *daemon) checkAndHeal(ctx context.Context, forceUnhealthy bool) {
 
 	if winner == nil {
 		log.Printf("health-check: рабочий endpoint не найден, оставляю %s как есть", current.endpoint)
-		return
+		return fmt.Errorf("не найден рабочий endpoint")
 	}
 	if winner.endpoint == current.endpoint {
 		// Тот же адрес переизбрался — но это уже новый, свежепрогретый
@@ -133,10 +146,10 @@ func (d *daemon) checkAndHeal(ctx context.Context, forceUnhealthy bool) {
 	old := d.active.Swap(winner)
 	d.state.mu.Lock()
 	d.state.switchCount++
+	d.state.lastHealthy = true
+	d.state.lastError = ""
 	d.state.mu.Unlock()
-	log.Printf("health-check: переключился на %s (был %s); старый туннель закрою через %s, дав дожить активным соединениям", winner.endpoint, old.endpoint, d.closeGrace)
-	go func(old *tunnel) {
-		time.Sleep(d.closeGrace)
-		old.Close()
-	}(old)
+	log.Printf("health-check: переключился на %s (был %s); старый туннель будет закрыт после завершения активных соединений", winner.endpoint, old.endpoint)
+	old.Retire()
+	return nil
 }

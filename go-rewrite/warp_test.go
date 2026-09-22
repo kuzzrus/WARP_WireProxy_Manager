@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"net/netip"
 	"os"
@@ -83,6 +84,34 @@ func TestAccountPersistenceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSaveAccountCorrectsExistingPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("NTFS does not expose POSIX mode bits")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "account.json")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	priv, pub := genKeyPair()
+	acct := &account{
+		privHex:    hex.EncodeToString(priv[:]),
+		peerPubHex: hex.EncodeToString(pub[:]),
+		addr4:      netip.MustParseAddr("172.16.0.2"),
+		addr6:      netip.MustParseAddr("2606:4700:110::2"),
+	}
+	if err := saveAccount(path, acct); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("got perms %v, want 0600", info.Mode().Perm())
+	}
+}
+
 func TestLoadAccountRejectsCorrupted(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.json")
@@ -115,7 +144,7 @@ func TestLoadOrRegisterAccountReusesExisting(t *testing.T) {
 	if err := saveAccount(path, seed); err != nil {
 		t.Fatal(err)
 	}
-	got, err := loadOrRegisterAccount(path, false)
+	got, err := loadOrRegisterAccount(context.Background(), path, false)
 	if err != nil {
 		t.Fatalf("loadOrRegisterAccount: %v", err)
 	}

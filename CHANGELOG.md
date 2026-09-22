@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.3.8 — audit hardening (warpwp 1.3.8, native 1.2.5)
+
+- The signed Bash update path now fails closed in every caller context: a bad
+  signature, hash, syntax check, lock, staging, or backup stops before either
+  installed script changes. Incomplete rollback keeps recovery copies.
+- Registration and complete native installation are transactional. Failed
+  backup, configuration, service restart, scan, or final check restores the
+  previous account, keys, configs, endpoint cache, unit, and service state.
+- Automatic routing cleanup no longer touches table `51820` or `lookup 51820`:
+  those may belong to a separate WireGuard tunnel. Explicit `--fix-routing
+  --force` is required for the legacy system-WARP cleanup.
+- The standalone cron installer now verifies the same signed manifest as the
+  manager. README bootstrap and Go update commands stop on verification errors;
+  the Go update ships and installs the matching release unit, restarts it, and
+  rolls back on failure.
+- Go prototype: rescans are serialized; retired tunnels wait for their active
+  SOCKS sessions; relay keeps TCP half-closes; account files are atomically
+  saved with 0600 permissions; registration is bounded and cancellable; and
+  nfqws cleanup runs on startup failures.
+
 ## v1.3.7 — warpwp 1.3.7, warp-wireproxy-native.sh 1.2.4
 
 - Перебор кандидатов в `select_best_endpoint_native`/`select_best_endpoint_warpscout`

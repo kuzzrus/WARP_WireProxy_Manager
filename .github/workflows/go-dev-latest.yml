@@ -19,6 +19,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: go-dev-latest-publish
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build ${{ matrix.goarch }}
@@ -75,11 +79,22 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Add matching systemd unit
+        run: cp go-rewrite/warpwp-go.service release-assets/warpwp-go.service
+
       - name: Checksums
         working-directory: release-assets
         run: |
           chmod 755 warpwp-go-linux-*
-          sha256sum warpwp-go-linux-* > SHA256SUMS
+          sha256sum warpwp-go-linux-* warpwp-go.service > SHA256SUMS
+
+      - name: Refuse to move dev-latest backwards
+        run: |
+          git fetch origin dev-latest || true
+          if git rev-parse --verify --quiet origin/dev-latest >/dev/null && ! git merge-base --is-ancestor origin/dev-latest HEAD; then
+            echo "dev-latest already points to a newer unrelated commit; refusing to publish an older build"
+            exit 1
+          fi
 
       - name: Move dev-latest tag to this commit
         run: |

@@ -8,10 +8,15 @@
 
 set -Eeuo pipefail
 
-RELEASE_TAG="${WARPWP_RELEASE_TAG:-v1.3.4}"
+RELEASE_TAG="${WARPWP_RELEASE_TAG:-v1.3.8}"
 RELEASE_BASE="https://github.com/kuzzrus/WARP_WireProxy_Manager/releases/download/$RELEASE_TAG"
 SCRIPT_URL="$RELEASE_BASE/warp-wireproxy-native.sh"
 SELF_URL="$RELEASE_BASE/install-warp-check.sh"
+MANIFEST_URL="$RELEASE_BASE/SHA256SUMS"
+SIGNATURE_URL="$RELEASE_BASE/SHA256SUMS.sig"
+RELEASE_SIGNING_ID="warpwp-release"
+RELEASE_SIGNING_NAMESPACE="warpwp-release"
+RELEASE_SIGNING_PUBLIC_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEa+mDJ1BJ6w2YdAogupkcdL8MJLo2XjMJlPT9WyQyA3"
 LOCAL_SCRIPT="/usr/local/bin/warp-wireproxy-native.sh"
 CRON_FILE="/etc/cron.d/warp-wireproxy-check"
 LOG_FILE="/var/log/warp-check.log"
@@ -26,6 +31,7 @@ TMP_SCRIPT=""
 BACKUP_SCRIPT=""
 NATIVE_REPLACED="0"
 INSTALL_COMMITTED="0"
+VERIFY_DIR=""
 
 log()  { printf '\033[1;36m[ИНФО]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m[ОК]\033[0m %s\n' "$*" >&2; }
@@ -35,6 +41,7 @@ err()  { printf '\033[1;31m[ОШИБКА]\033[0m %s\n' "$*" >&2; }
 cleanup() {
   [[ -n "$TMP_SCRIPT" ]] && rm -f -- "$TMP_SCRIPT" 2>/dev/null || true
   [[ -n "$BACKUP_SCRIPT" ]] && rm -f -- "$BACKUP_SCRIPT" 2>/dev/null || true
+  [[ -n "$VERIFY_DIR" ]] && rm -rf -- "$VERIFY_DIR" 2>/dev/null || true
 }
 
 on_exit() {
@@ -173,12 +180,10 @@ remove_project_timer() {
 install_native_script() {
   local target_dir
   target_dir="$(dirname "$LOCAL_SCRIPT")"
-  mkdir -p "$target_dir"
-
-  TMP_SCRIPT="$(mktemp "$target_dir/.warp-wireproxy-native.XXXXXX")"
-  curl -fsSL "$SCRIPT_URL" -o "$TMP_SCRIPT"
-  bash -n "$TMP_SCRIPT"
-  chmod 0755 "$TMP_SCRIPT"
+  mkdir -p "$target_dir" || return 1
+  download_verified_native || return 1
+  TMP_SCRIPT="$(mktemp "$target_dir/.warp-wireproxy-native.XXXXXX")" || return 1
+  install -m 0755 "$VERIFY_DIR/warp-wireproxy-native.sh" "$TMP_SCRIPT" || return 1
 
   if [[ -e "$LOCAL_SCRIPT" || -L "$LOCAL_SCRIPT" ]]; then
     BACKUP_SCRIPT="$(mktemp "$target_dir/.warp-wireproxy-native.backup.XXXXXX")"
@@ -188,6 +193,34 @@ install_native_script() {
   mv -f -- "$TMP_SCRIPT" "$LOCAL_SCRIPT"
   TMP_SCRIPT=""
   NATIVE_REPLACED="1"
+}
+
+verify_manifest() {
+  local manifest="$1" signature="$2" allowed="$3"
+  printf '%s\n' "$RELEASE_SIGNING_ID $RELEASE_SIGNING_PUBLIC_KEY" > "$allowed" || return 1
+  ssh-keygen -Y verify -f "$allowed" -I "$RELEASE_SIGNING_ID" -n "$RELEASE_SIGNING_NAMESPACE" -s "$signature" < "$manifest"
+}
+
+verify_asset() {
+  local manifest="$1" asset="$2" file="$3" expected
+  expected="$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { if (seen++) duplicate=1; hash=$1 } END { if (seen != 1 || duplicate) exit 1; print hash }' "$manifest")" || return 1
+  printf '%s  %s\n' "$expected" "$file" | sha256sum -c --status -
+}
+
+download_verified_native() {
+  local manifest signature allowed
+  command -v ssh-keygen >/dev/null 2>&1 || { err "Для проверки подписанного release нужен ssh-keygen (openssh-client)."; return 1; }
+  command -v sha256sum >/dev/null 2>&1 || { err "Для проверки release нужен sha256sum."; return 1; }
+  VERIFY_DIR="$(mktemp -d)" || return 1
+  manifest="$VERIFY_DIR/SHA256SUMS"
+  signature="$VERIFY_DIR/SHA256SUMS.sig"
+  allowed="$VERIFY_DIR/allowed_signers"
+  curl -fsSL "$MANIFEST_URL" -o "$manifest" || return 1
+  curl -fsSL "$SIGNATURE_URL" -o "$signature" || return 1
+  verify_manifest "$manifest" "$signature" "$allowed" || { err "Подпись SHA256SUMS не прошла проверку; установка отменена."; return 1; }
+  curl -fsSL "$SCRIPT_URL" -o "$VERIFY_DIR/warp-wireproxy-native.sh" || return 1
+  verify_asset "$manifest" warp-wireproxy-native.sh "$VERIFY_DIR/warp-wireproxy-native.sh" || { err "Хеш native-скрипта не совпал с подписанным manifest; установка отменена."; return 1; }
+  bash -n "$VERIFY_DIR/warp-wireproxy-native.sh" || { err "Скачанный native-скрипт имеет ошибку синтаксиса; установка отменена."; return 1; }
 }
 
 usage() {

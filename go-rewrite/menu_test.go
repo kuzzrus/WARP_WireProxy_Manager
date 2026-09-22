@@ -40,7 +40,7 @@ func TestMenuViewShowsUnreachableDaemon(t *testing.T) {
 
 func TestMenuUpdateAppliesStatus(t *testing.T) {
 	m := menuModel{control: "127.0.0.1:41081", rescanning: true}
-	next, _ := m.Update(statusMsg{s: &statusResponse{ActiveEndpoint: "1.2.3.4:2408"}})
+	next, _ := m.Update(statusMsg{s: &statusResponse{ActiveEndpoint: "1.2.3.4:2408"}, rescan: true})
 	nm := next.(menuModel)
 	if nm.rescanning {
 		t.Fatal("rescanning должен сброситься после получения statusMsg")

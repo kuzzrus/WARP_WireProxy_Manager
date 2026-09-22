@@ -16,13 +16,23 @@ func installNfqws(args []string) {
 	if os.Geteuid() != 0 {
 		log.Fatalf("нужен root: sudo warpwp-go install-nfqws")
 	}
-	if p, err := exec.LookPath("nfqws"); err == nil {
-		fmt.Println("nfqws уже установлен:", p)
-		return
-	}
 	if _, err := exec.LookPath("apt-get"); err != nil {
 		log.Fatalf("автоустановка поддерживает только apt (Debian/Ubuntu). " +
 			"На другом дистрибутиве собери вручную: https://github.com/bol-van/zapret (каталог nfq, make)")
+	}
+	if _, err := exec.LookPath("nft"); err != nil {
+		log.Printf("install-nfqws: ставлю runtime-зависимость nftables...")
+		cmd := exec.Command("apt-get", "install", "-y", "-qq", "nftables")
+		cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			log.Fatalf("install-nfqws: nftables: %v", err)
+		}
+	}
+	if p, err := exec.LookPath("nfqws"); err == nil {
+		fmt.Println("nfqws уже установлен:", p)
+		return
 	}
 
 	tmp, err := os.MkdirTemp("", "warpwp-nfqws-build-")
@@ -37,7 +47,7 @@ func installNfqws(args []string) {
 	}{
 		{"обновляю списки пакетов", exec.Command("apt-get", "update", "-qq")},
 		{"ставлю зависимости сборки", exec.Command("apt-get", "install", "-y", "-qq",
-			"build-essential", "git", "zlib1g-dev", "libnetfilter-queue-dev", "libnfnetlink-dev", "libmnl-dev", "libcap-dev")},
+			"build-essential", "git", "zlib1g-dev", "libnetfilter-queue-dev", "libnfnetlink-dev", "libmnl-dev", "libcap-dev", "nftables")},
 		{"клонирую zapret (bol-van/zapret)", exec.Command("git", "clone", "--depth", "1",
 			"https://github.com/bol-van/zapret.git", tmp+"/zapret")},
 	}

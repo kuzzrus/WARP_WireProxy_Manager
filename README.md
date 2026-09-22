@@ -54,8 +54,8 @@ https://github.com/kuzzrus/WARP_WireProxy_Manager
 Текущая версия:
 
 ```text
-warpwp v1.3.5
-warp-wireproxy-native.sh v1.2.2
+warpwp v1.3.8
+warp-wireproxy-native.sh v1.2.5
 ```
 
 ---
@@ -65,16 +65,21 @@ warp-wireproxy-native.sh v1.2.2
 Установить менеджер из подписанного release (замени `TAG` на нужную версию):
 
 ```bash
-TAG=v1.3.5
+sudo bash <<'INSTALL_WARPWP'
+set -Eeuo pipefail
+TAG=v1.3.8
 BASE="https://github.com/kuzzrus/WARP_WireProxy_Manager/releases/download/$TAG"
-TMP_DIR="$(mktemp -d)" && trap 'rm -rf "$TMP_DIR"' EXIT
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$TMP_DIR"' EXIT
 for FILE in warpwp.sh warp-wireproxy-native.sh install-warp-check.sh warp-wireproxy-auto.sh release-signing.pub SHA256SUMS SHA256SUMS.sig; do
-  curl -fsSLo "$TMP_DIR/$FILE" "$BASE/$FILE"
+  curl -fsSLo "$TMP_DIR/$FILE" "$BASE/$FILE" || exit 1
 done
 printf '%s\n' 'warpwp-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEa+mDJ1BJ6w2YdAogupkcdL8MJLo2XjMJlPT9WyQyA3' > "$TMP_DIR/allowed_signers"
-ssh-keygen -Y verify -f "$TMP_DIR/allowed_signers" -I warpwp-release -n warpwp-release -s "$TMP_DIR/SHA256SUMS.sig" < "$TMP_DIR/SHA256SUMS"
-(cd "$TMP_DIR" && sha256sum -c --strict SHA256SUMS)
+ssh-keygen -Y verify -f "$TMP_DIR/allowed_signers" -I warpwp-release -n warpwp-release -s "$TMP_DIR/SHA256SUMS.sig" < "$TMP_DIR/SHA256SUMS" || exit 1
+(cd "$TMP_DIR" && sha256sum -c --strict SHA256SUMS) || exit 1
+bash -n "$TMP_DIR/warpwp.sh" || exit 1
 install -m 0755 "$TMP_DIR/warpwp.sh" /usr/local/bin/warpwp
+INSTALL_WARPWP
 ```
 
 Установить/обновить WARP + wireproxy + cron:
@@ -461,7 +466,7 @@ warpwp --update
 Чтобы установить строго определённую версию:
 
 ```bash
-warpwp --update v1.3.5
+warpwp --update v1.3.8
 ```
 
 ---
@@ -536,22 +541,51 @@ scripts/check.sh
 `warpwp.sh`) — проверяется только `SHA256SUMS`.
 
 ```bash
+sudo bash <<'INSTALL_WARPWP_GO'
+set -Eeuo pipefail
 TAG=dev-latest   # или конкретный go-vX.Y.Z
 ARCH=amd64       # или arm64
 BASE="https://github.com/kuzzrus/WARP_WireProxy_Manager/releases/download/$TAG"
+ASSET="warpwp-go-linux-$ARCH"
+BIN=/usr/local/bin/warpwp-go
+UNIT=/etc/systemd/system/warpwp-go.service
+TMP_DIR="$(mktemp -d)"
+HAD_BIN=0
+HAD_UNIT=0
+COMMITTED=0
+rollback() {
+  local rc=$?
+  if [[ $rc -ne 0 && $COMMITTED -ne 1 ]]; then
+    if [[ $HAD_BIN -eq 1 ]]; then mv -f "$TMP_DIR/warpwp-go.backup" "$BIN" || true; else rm -f "$BIN"; fi
+    if [[ $HAD_UNIT -eq 1 ]]; then mv -f "$TMP_DIR/warpwp-go.service.backup" "$UNIT" || true; else rm -f "$UNIT"; fi
+    systemctl daemon-reload || true
+    systemctl restart warpwp-go || true
+  fi
+  rm -rf -- "$TMP_DIR"
+  exit "$rc"
+}
+trap rollback EXIT
 
-curl -fsSL "$BASE/warpwp-go-linux-$ARCH" -o /usr/local/bin/warpwp-go.new
-curl -fsSL "$BASE/SHA256SUMS" -o /tmp/SHA256SUMS
-grep "warpwp-go-linux-$ARCH" /tmp/SHA256SUMS \
-  | sed "s#warpwp-go-linux-$ARCH#/usr/local/bin/warpwp-go.new#" \
-  | sha256sum -c -
-chmod +x /usr/local/bin/warpwp-go.new
-mv /usr/local/bin/warpwp-go.new /usr/local/bin/warpwp-go
-
-curl -fsSL https://raw.githubusercontent.com/kuzzrus/WARP_WireProxy_Manager/main/go-rewrite/warpwp-go.service \
-  -o /etc/systemd/system/warpwp-go.service
+curl -fsSLo "$TMP_DIR/$ASSET" "$BASE/$ASSET"
+curl -fsSLo "$TMP_DIR/warpwp-go.service" "$BASE/warpwp-go.service"
+curl -fsSLo "$TMP_DIR/SHA256SUMS" "$BASE/SHA256SUMS"
+for FILE in "$ASSET" warpwp-go.service; do
+  HASH="$(awk -v asset="$FILE" '$2 == asset || $2 == "*" asset { print $1; found=1 } END { exit !found }' "$TMP_DIR/SHA256SUMS")"
+  [[ -n "$HASH" ]] || exit 1
+  printf '%s  %s\n' "$HASH" "$TMP_DIR/$FILE" | sha256sum -c --status - || exit 1
+done
+install -m 0755 "$TMP_DIR/$ASSET" "$TMP_DIR/warpwp-go.new"
+install -m 0644 "$TMP_DIR/warpwp-go.service" "$TMP_DIR/warpwp-go.service.new"
+[[ -e "$BIN" || -L "$BIN" ]] && { cp -a "$BIN" "$TMP_DIR/warpwp-go.backup"; HAD_BIN=1; }
+[[ -e "$UNIT" || -L "$UNIT" ]] && { cp -a "$UNIT" "$TMP_DIR/warpwp-go.service.backup"; HAD_UNIT=1; }
+mv -f "$TMP_DIR/warpwp-go.new" "$BIN"
+mv -f "$TMP_DIR/warpwp-go.service.new" "$UNIT"
 systemctl daemon-reload
-systemctl enable --now warpwp-go
+systemctl enable warpwp-go
+systemctl restart warpwp-go
+systemctl is-active --quiet warpwp-go
+COMMITTED=1
+INSTALL_WARPWP_GO
 ```
 
 Если `sha256sum -c` не напечатал `OK` — не продолжай, файл побился при

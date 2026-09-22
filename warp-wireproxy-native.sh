@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.2.4"
+VERSION="1.2.5"
 SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="40000"
 SOCKS_HOST_EXPLICIT="0"
@@ -64,6 +64,9 @@ SCAN_TRANSACTION_ACTIVE="0"
 SCAN_ORIGINAL_ENDPOINT=""
 REGISTRATION_TRANSACTION_ACTIVE="0"
 REGISTRATION_TRANSACTION_DIR=""
+INSTALL_TRANSACTION_ACTIVE="0"
+INSTALL_TRANSACTION_DIR=""
+INSTALL_BACKUP_ROOT="${INSTALL_BACKUP_ROOT:-/root/warp-wireproxy-native-backup}"
 
 BEST_ENDPOINT=""
 BEST_TIME=""
@@ -403,7 +406,7 @@ PY
   if [[ "$url" == *.zip ]]; then unzip -q "$tmp" -d "$tmpdir"; elif [[ "$url" == *.tar.gz || "$url" == *.tgz ]]; then tar -xzf "$tmp" -C "$tmpdir"; else cp "$tmp" "$tmpdir/wireproxy"; fi
   bin="$(find "$tmpdir" -type f \( -name 'wireproxy' -o -name 'wireproxy-*' \) | head -n1 || true)"
   [[ -n "$bin" ]] || return 1
-  install -m 0755 "$bin" /usr/local/bin/wireproxy
+  install -m 0755 "$bin" /usr/local/bin/wireproxy || return 1
   rm -rf "$tmp" "$tmpdir"
   ok "wireproxy установлен: /usr/local/bin/wireproxy"
 }
@@ -419,14 +422,90 @@ install_wireproxy_from_go() {
 }
 ensure_wireproxy_installed() { find_wireproxy_bin >/dev/null 2>&1 && { ok "wireproxy уже установлен: $(find_wireproxy_bin)"; return 0; }; install_wireproxy_from_release || install_wireproxy_from_go; }
 
-backup_existing() {
-  mkdir -p /root/warp-wireproxy-native-backup
-  local ts
-  ts="$(date +%Y%m%d-%H%M%S)"
-  for f in "$WARP_CONF" "$LEGACY_WARP_CONF" "$PROXY_CONF" "$ACCOUNT_JSON" "$PRIVATE_KEY_FILE" "$SERVICE_FILE" "$GOOD_ENDPOINTS_FILE" "$BAD_ENDPOINTS_FILE"; do
-    [[ -f "$f" ]] && cp -a "$f" "/root/warp-wireproxy-native-backup/$(basename "$f").$ts.bak" || true
-  done
+snapshot_install_file() {
+  local target="$1" name="$2"
+  [[ -n "$INSTALL_TRANSACTION_DIR" ]] || return 1
+  if [[ -e "$target" || -L "$target" ]]; then
+    : > "$INSTALL_TRANSACTION_DIR/$name.existed" || return 1
+    cp -a -- "$target" "$INSTALL_TRANSACTION_DIR/$name.backup" || return 1
+  fi
 }
+
+restore_install_file() {
+  local target="$1" name="$2"
+  if [[ -f "$INSTALL_TRANSACTION_DIR/$name.existed" ]]; then
+    [[ -e "$INSTALL_TRANSACTION_DIR/$name.backup" || -L "$INSTALL_TRANSACTION_DIR/$name.backup" ]] || return 1
+    cp -a -- "$INSTALL_TRANSACTION_DIR/$name.backup" "$target"
+  else
+    rm -f -- "$target"
+  fi
+}
+
+begin_install_transaction() {
+  local target name
+  mkdir -p "$INSTALL_BACKUP_ROOT" || return 1
+  INSTALL_TRANSACTION_DIR="$(mktemp -d "$INSTALL_BACKUP_ROOT/transaction.XXXXXX")" || return 1
+  chmod 700 "$INSTALL_TRANSACTION_DIR" || { rm -rf -- "$INSTALL_TRANSACTION_DIR"; INSTALL_TRANSACTION_DIR=""; return 1; }
+  INSTALL_TRANSACTION_ACTIVE="0"
+  while IFS='|' read -r target name; do
+    snapshot_install_file "$target" "$name" || {
+      err "Не удалось создать резервную копию $target; установка не начата."
+      rm -rf -- "$INSTALL_TRANSACTION_DIR"
+      INSTALL_TRANSACTION_DIR=""
+      return 1
+    }
+  done <<EOF_SNAPSHOTS
+$WARP_CONF|warp-conf
+$LEGACY_WARP_CONF|legacy-warp-conf
+$PROXY_CONF|proxy-conf
+$ACCOUNT_JSON|account
+$PRIVATE_KEY_FILE|private-key
+$SERVICE_FILE|service
+$GOOD_ENDPOINTS_FILE|good-endpoints
+$BAD_ENDPOINTS_FILE|bad-endpoints
+EOF_SNAPSHOTS
+  systemctl is-active --quiet wireproxy 2>/dev/null && : > "$INSTALL_TRANSACTION_DIR/service.was-active" || true
+  systemctl is-enabled --quiet wireproxy 2>/dev/null && : > "$INSTALL_TRANSACTION_DIR/service.was-enabled" || true
+  INSTALL_TRANSACTION_ACTIVE="1"
+}
+
+rollback_install_transaction() {
+  local failed=0 target name
+  [[ "$INSTALL_TRANSACTION_ACTIVE" == "1" && -n "$INSTALL_TRANSACTION_DIR" ]] || return 0
+  warn "Откатываю незавершённую установку WARP/wireproxy к предыдущей рабочей конфигурации."
+  systemctl stop wireproxy 2>/dev/null || true
+  while IFS='|' read -r target name; do
+    restore_install_file "$target" "$name" || { err "Не удалось восстановить $target."; failed=1; }
+  done <<EOF_RESTORE
+$WARP_CONF|warp-conf
+$LEGACY_WARP_CONF|legacy-warp-conf
+$PROXY_CONF|proxy-conf
+$ACCOUNT_JSON|account
+$PRIVATE_KEY_FILE|private-key
+$GOOD_ENDPOINTS_FILE|good-endpoints
+$BAD_ENDPOINTS_FILE|bad-endpoints
+$SERVICE_FILE|service
+EOF_RESTORE
+  systemctl daemon-reload 2>/dev/null || failed=1
+  if [[ -f "$INSTALL_TRANSACTION_DIR/service.was-enabled" ]]; then systemctl enable wireproxy >/dev/null 2>&1 || failed=1; else systemctl disable wireproxy >/dev/null 2>&1 || true; fi
+  if [[ -f "$INSTALL_TRANSACTION_DIR/service.was-active" ]]; then systemctl start wireproxy >/dev/null 2>&1 || failed=1; else systemctl stop wireproxy >/dev/null 2>&1 || true; fi
+  if [[ "$failed" == "1" ]]; then
+    err "Откат завершился с ошибкой; резервная копия сохранена: $INSTALL_TRANSACTION_DIR"
+    return 1
+  fi
+  INSTALL_TRANSACTION_ACTIVE="0"
+  rm -rf -- "$INSTALL_TRANSACTION_DIR"
+  INSTALL_TRANSACTION_DIR=""
+}
+
+commit_install_transaction() {
+  [[ "$INSTALL_TRANSACTION_ACTIVE" == "1" ]] || return 0
+  INSTALL_TRANSACTION_ACTIVE="0"
+  rm -rf -- "$INSTALL_TRANSACTION_DIR"
+  INSTALL_TRANSACTION_DIR=""
+}
+
+backup_existing() { begin_install_transaction; }
 
 routing_guard_report() {
   local family label table
@@ -453,46 +532,8 @@ routing_guard_report() {
 }
 
 cleanup_system_warp_routes() {
-  local failed=0 family line priority svc
-  warn "Проверяю и очищаю системный WARP full-tunnel, если он включён..."
-  for svc in wg-quick@warp wg-quick@wgcf warp-svc; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null || systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-      systemctl disable --now "$svc" >/dev/null 2>&1 || failed=1
-    fi
-  done
-  if ip link show warp >/dev/null 2>&1; then
-    ip link del warp 2>/dev/null || failed=1
-  fi
-  for family in -4 -6; do
-    while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
-      priority="${line%%:*}"
-      if [[ "$priority" =~ ^[0-9]+$ ]]; then
-        ip "$family" rule del pref "$priority" 2>/dev/null || failed=1
-      else
-        warn "Не удалось определить priority WARP rule ($family): $line"
-        failed=1
-      fi
-    done < <(ip "$family" rule show 2>/dev/null | grep -E 'lookup (51820|warp)([[:space:]]|$)' || true)
-    ip "$family" route flush table 51820 2>/dev/null || true
-    ip "$family" route flush table warp 2>/dev/null || true
-  done
-  if ip link show warp >/dev/null 2>&1; then
-    err "После cleanup остался интерфейс warp."
-    failed=1
-  fi
-  for family in -4 -6; do
-    if ip "$family" rule show 2>/dev/null | grep -Eq 'lookup (51820|warp)([[:space:]]|$)'; then
-      err "После cleanup остались WARP policy rules ($family)."
-      failed=1
-    fi
-    if ip "$family" route show table 51820 2>/dev/null | grep -q . || ip "$family" route show table warp 2>/dev/null | grep -q .; then
-      err "После cleanup таблица WARP не пуста ($family)."
-      failed=1
-    fi
-  done
-  [[ "$failed" -eq 0 ]] || return 1
-  ok "Системные WARP routes очищены. wireproxy SOCKS5 не тронут."
+  warn "Автоматическая очистка system WARP отключена: таблица 51820 может принадлежать чужому WireGuard-туннелю. Установка использует только wireproxy SOCKS5 и не меняет ip rule/route."
+  routing_guard_report
 }
 
 validate_account_pair() {
@@ -524,17 +565,26 @@ PY
 }
 
 rollback_registration_transaction() {
+  local failed=0
   [[ "$REGISTRATION_TRANSACTION_ACTIVE" == "1" && -n "$REGISTRATION_TRANSACTION_DIR" ]] || return 0
   warn "Откатываю незавершённую замену WARP account/private key."
-  if [[ -f "$REGISTRATION_TRANSACTION_DIR/private.existed" ]]; then
-    cp -a "$REGISTRATION_TRANSACTION_DIR/private.backup" "$PRIVATE_KEY_FILE" 2>/dev/null || true
-  else
-    rm -f "$PRIVATE_KEY_FILE" 2>/dev/null || true
+  if [[ -f "$REGISTRATION_TRANSACTION_DIR/private.replaced" ]]; then
+    if [[ -f "$REGISTRATION_TRANSACTION_DIR/private.original-existed" ]]; then
+      [[ -f "$REGISTRATION_TRANSACTION_DIR/private.backup-ready" ]] && cp -a "$REGISTRATION_TRANSACTION_DIR/private.backup" "$PRIVATE_KEY_FILE" 2>/dev/null || failed=1
+    else
+      rm -f "$PRIVATE_KEY_FILE" 2>/dev/null || failed=1
+    fi
   fi
-  if [[ -f "$REGISTRATION_TRANSACTION_DIR/account.existed" ]]; then
-    cp -a "$REGISTRATION_TRANSACTION_DIR/account.backup" "$ACCOUNT_JSON" 2>/dev/null || true
-  else
-    rm -f "$ACCOUNT_JSON" 2>/dev/null || true
+  if [[ -f "$REGISTRATION_TRANSACTION_DIR/account.replaced" ]]; then
+    if [[ -f "$REGISTRATION_TRANSACTION_DIR/account.original-existed" ]]; then
+      [[ -f "$REGISTRATION_TRANSACTION_DIR/account.backup-ready" ]] && cp -a "$REGISTRATION_TRANSACTION_DIR/account.backup" "$ACCOUNT_JSON" 2>/dev/null || failed=1
+    else
+      rm -f "$ACCOUNT_JSON" 2>/dev/null || failed=1
+    fi
+  fi
+  if [[ "$failed" == "1" ]]; then
+    err "Не удалось полностью восстановить WARP account/private key; backup сохранён: $REGISTRATION_TRANSACTION_DIR"
+    return 1
   fi
   REGISTRATION_TRANSACTION_ACTIVE="0"
   rm -rf -- "$REGISTRATION_TRANSACTION_DIR" 2>/dev/null || true
@@ -542,7 +592,8 @@ rollback_registration_transaction() {
 }
 
 register_warp_account() {
-  mkdir -p "$WG_DIR"; chmod 700 "$WG_DIR"
+  mkdir -p "$WG_DIR" || return 1
+  chmod 700 "$WG_DIR" || return 1
   if [[ "$FORCE_REGISTER" != "1" && -f "$ACCOUNT_JSON" && -f "$PRIVATE_KEY_FILE" ]]; then
     if validate_account_pair "$ACCOUNT_JSON" "$PRIVATE_KEY_FILE"; then
       ok "WARP-аккаунт уже есть. Использую существующий $ACCOUNT_JSON"
@@ -557,38 +608,43 @@ register_warp_account() {
   private_key="$(wg genkey)" || { err "Не удалось создать WireGuard private key."; return 1; }
   public_key="$(printf '%s' "$private_key" | wg pubkey)" || { err "Не удалось получить WireGuard public key."; return 1; }
   tos="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-  printf '%s\n' "$private_key" > "$staged_key"
-  chmod 600 "$staged_key"
+  printf '%s\n' "$private_key" > "$staged_key" || return 1
+  chmod 600 "$staged_key" || return 1
   body="$(python3 - "$public_key" "$tos" <<'PY'
 import json, sys
 pub, tos = sys.argv[1], sys.argv[2]
 print(json.dumps({'key': pub, 'install_id': '', 'fcm_token': '', 'tos': tos, 'type': 'Android', 'model': 'PC', 'locale': 'en_US'}))
 PY
-)"
-  if ! curl -fsSL -X POST 'https://api.cloudflareclient.com/v0a2158/reg' -H 'Content-Type: application/json; charset=UTF-8' -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.11-2223' --data "$body" > "$staged_account"; then
+  )" || return 1
+  if ! curl --connect-timeout 10 --max-time 30 -fsSL -X POST 'https://api.cloudflareclient.com/v0a2158/reg' -H 'Content-Type: application/json; charset=UTF-8' -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.11-2223' --data "$body" > "$staged_account"; then
     err "Cloudflare API не зарегистрировал WARP-устройство; рабочие ключи не изменены."
     return 1
   fi
-  chmod 600 "$staged_account"
+  chmod 600 "$staged_account" || return 1
   validate_account_pair "$staged_account" "$staged_key" || {
     err "Cloudflare API вернул неполный account; рабочие ключи не изменены."
     return 1
   }
 
   txn_dir="$(mktemp -d "$WG_DIR/.warp-registration.XXXXXX")" || return 1
-  chmod 700 "$txn_dir"
+  chmod 700 "$txn_dir" || { rm -rf -- "$txn_dir"; return 1; }
   REGISTRATION_TRANSACTION_DIR="$txn_dir"
-  REGISTRATION_TRANSACTION_ACTIVE="1"
+  REGISTRATION_TRANSACTION_ACTIVE="0"
   if [[ -f "$PRIVATE_KEY_FILE" ]]; then
-    if ! cp -a "$PRIVATE_KEY_FILE" "$txn_dir/private.backup"; then rollback_registration_transaction; return 1; fi
-    : > "$txn_dir/private.existed"
+    : > "$txn_dir/private.original-existed" || { rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; }
+    if ! cp -a "$PRIVATE_KEY_FILE" "$txn_dir/private.backup"; then rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; fi
+    : > "$txn_dir/private.backup-ready" || { rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; }
   fi
   if [[ -f "$ACCOUNT_JSON" ]]; then
-    if ! cp -a "$ACCOUNT_JSON" "$txn_dir/account.backup"; then rollback_registration_transaction; return 1; fi
-    : > "$txn_dir/account.existed"
+    : > "$txn_dir/account.original-existed" || { rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; }
+    if ! cp -a "$ACCOUNT_JSON" "$txn_dir/account.backup"; then rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; fi
+    : > "$txn_dir/account.backup-ready" || { rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; }
   fi
-  install -m 0600 "$staged_key" "$txn_dir/private.new" || { rollback_registration_transaction; return 1; }
-  install -m 0600 "$staged_account" "$txn_dir/account.new" || { rollback_registration_transaction; return 1; }
+  install -m 0600 "$staged_key" "$txn_dir/private.new" || { rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; }
+  install -m 0600 "$staged_account" "$txn_dir/account.new" || { rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; }
+  : > "$txn_dir/private.replaced" || { rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; }
+  : > "$txn_dir/account.replaced" || { rm -rf -- "$txn_dir"; REGISTRATION_TRANSACTION_DIR=""; return 1; }
+  REGISTRATION_TRANSACTION_ACTIVE="1"
   mv -f "$txn_dir/private.new" "$PRIVATE_KEY_FILE" || { rollback_registration_transaction; return 1; }
   mv -f "$txn_dir/account.new" "$ACCOUNT_JSON" || { rollback_registration_transaction; return 1; }
   validate_account_pair "$ACCOUNT_JSON" "$PRIVATE_KEY_FILE" || { rollback_registration_transaction; return 1; }
@@ -612,13 +668,13 @@ PY
 
 write_configs() {
   local cfg private address_v4 address_v6 peer_public endpoint
-  cfg="$(json_get_config)"
+  cfg="$(json_get_config)" || return 1
   private="$(echo "$cfg" | awk -F= '/^PRIVATE_KEY=/{print substr($0,index($0,"=")+1)}')"
   address_v4="$(echo "$cfg" | awk -F= '/^ADDRESS_V4=/{print substr($0,index($0,"=")+1)}')"
   address_v6="$(echo "$cfg" | awk -F= '/^ADDRESS_V6=/{print substr($0,index($0,"=")+1)}')"
   peer_public="$(echo "$cfg" | awk -F= '/^PEER_PUBLIC_KEY=/{print substr($0,index($0,"=")+1)}')"
   endpoint="$(echo "$cfg" | awk -F= '/^ENDPOINT=/{print substr($0,index($0,"=")+1)}')"
-  cat > "$WARP_CONF" <<EOF_WARP
+  cat > "$WARP_CONF" <<EOF_WARP || return 1
 # Internal WARP config mirror for WARP WireProxy Manager.
 # Do NOT run this file with wg-quick. Use wireproxy.service and $PROXY_CONF.
 [Interface]
@@ -636,8 +692,8 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = $endpoint
 PersistentKeepalive = 25
 EOF_WARP
-  chmod 600 "$WARP_CONF"
-  cat > "$PROXY_CONF" <<EOF_PROXY
+  chmod 600 "$WARP_CONF" || return 1
+  cat > "$PROXY_CONF" <<EOF_PROXY || return 1
 [Interface]
 PrivateKey = $private
 Address = $address_v4/32
@@ -654,8 +710,8 @@ PersistentKeepalive = 25
 [Socks5]
 BindAddress = $SOCKS_HOST:$SOCKS_PORT
 EOF_PROXY
-  chmod 600 "$PROXY_CONF"
-  cat > "$LEGACY_WARP_CONF" <<EOF_LEGACY
+  chmod 600 "$PROXY_CONF" || return 1
+  cat > "$LEGACY_WARP_CONF" <<EOF_LEGACY || return 1
 # Guard file created by WARP WireProxy Manager.
 # This project uses Cloudflare WARP only through wireproxy SOCKS5: $SOCKS_HOST:$SOCKS_PORT
 # Do NOT run: wg-quick up warp / systemctl enable --now wg-quick@warp
@@ -674,7 +730,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = $endpoint
 PersistentKeepalive = 25
 EOF_LEGACY
-  chmod 600 "$LEGACY_WARP_CONF"
+  chmod 600 "$LEGACY_WARP_CONF" || return 1
   ok "Конфиги созданы. Первичный endpoint: $endpoint"
   ok "Защита от случайного wg-quick@warp включена: $LEGACY_WARP_CONF"
 }
@@ -691,7 +747,7 @@ set_endpoint() {
 }
 create_service() {
   local bin; bin="$(find_wireproxy_bin)"
-  cat > "$SERVICE_FILE" <<EOF_SERVICE
+  cat > "$SERVICE_FILE" <<EOF_SERVICE || return 1
 [Unit]
 Description=WireProxy for WARP
 Documentation=https://github.com/pufferffish/wireproxy
@@ -708,7 +764,9 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF_SERVICE
-  systemctl daemon-reload; systemctl enable wireproxy >/dev/null 2>&1 || true; ok "wireproxy.service создан."
+  systemctl daemon-reload || return 1
+  systemctl enable wireproxy >/dev/null 2>&1 || return 1
+  ok "wireproxy.service создан."
 }
 ensure_service_exists() { [[ -f "$SERVICE_FILE" ]] || systemctl list-unit-files 2>/dev/null | grep -q '^wireproxy\.service' && return 0; find_wireproxy_bin >/dev/null 2>&1 && [[ -f "$PROXY_CONF" ]] && { create_service; return 0; }; return 1; }
 # wireproxy занимает порт за доли секунды. Опрос вместо фиксированного
@@ -723,8 +781,25 @@ socks_proxy_url() {
   printf 'socks5h://%s:%s' "$host" "$port"
 }
 socks_port_listening() {
-  local address
-  address="$(socks_address "${1:-}" "${2:-}")"
+  local host="${1:-$SOCKS_HOST}" port="${2:-$SOCKS_PORT}" address resolved
+  host="${host#[}"
+  host="${host%]}"
+  case "$host" in
+    0.0.0.0) host="127.0.0.1" ;;
+    ::) host="::1" ;;
+  esac
+  if [[ "$host" != *:* && "$host" =~ [[:alpha:]] ]]; then
+    while IFS= read -r resolved; do
+      [[ -n "$resolved" ]] || continue
+      if ss -H -lnt 2>/dev/null | awk -v address="$resolved:$port" '$4 == address { found=1 } END { exit !found }'; then return 0; fi
+    done < <(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+    while IFS= read -r resolved; do
+      [[ -n "$resolved" ]] || continue
+      if ss -H -lnt 2>/dev/null | awk -v address="[$resolved]:$port" '$4 == address { found=1 } END { exit !found }'; then return 0; fi
+    done < <(getent ahostsv6 "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+    return 1
+  fi
+  [[ "$host" == *:* ]] && address="[$host]:$port" || address="$host:$port"
   ss -H -lnt 2>/dev/null | awk -v address="$address" '$4 == address { found=1 } END { exit !found }'
 }
 wait_for_socks_port() {
@@ -1158,6 +1233,10 @@ final_check() {
     systemctl status wireproxy --no-pager -l | head -80 || true
     return 1
   fi
+  if [[ "$POLICY_MODE" == "strict" ]] && ! endpoint_matches_policy "$(printf '%s\n' "$BEST_TRACE" | awk -F= '$1=="colo"{print $2; exit}')" "$(printf '%s\n' "$BEST_TRACE" | awk -F= '$1=="loc"{print $2; exit}')"; then
+    err "Финальная проверка прошла через WARP, но не соответствует strict policy: $(policy_summary)."
+    return 1
+  fi
   ok "WARP работает: warp=on"
 }
 
@@ -1246,6 +1325,7 @@ cleanup() {
   trap - EXIT INT TERM
   stop_scan_wireproxy
   rollback_registration_transaction
+  rollback_install_transaction
   rollback_scan_transaction
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" && "$TMP_DIR" == /tmp/warp-wireproxy-native.* ]]; then rm -rf -- "$TMP_DIR"; fi
   if [[ "$INTERNAL_LOCK_HELD" == "1" ]]; then flock -u 9 2>/dev/null || true; fi
@@ -1274,16 +1354,18 @@ main() {
     acquire_internal_lock
   fi
   cleanup_system_warp_routes || exit 1
-  ensure_wireproxy_installed
-  backup_existing
-  register_warp_account
-  write_configs
-  create_service
+  ensure_wireproxy_installed || exit 1
+  if [[ -f "$PROXY_CONF" ]]; then load_socks_bind_from_proxy || exit 1; fi
+  backup_existing || exit 1
+  register_warp_account || exit 1
+  write_configs || exit 1
+  create_service || exit 1
   restart_wireproxy || exit 1
   check_port || exit 1
   select_best_endpoint
   final_check || exit 1
   commit_scan_transaction
+  commit_install_transaction
   routing_guard_report
   print_result
 }

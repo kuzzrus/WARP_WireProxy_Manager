@@ -39,6 +39,17 @@ func handleSOCKS5Conn(c net.Conn, active *atomic.Pointer[tunnel]) {
 			return
 		}
 	}
+	supportsNoAuth := false
+	for _, method := range buf[:nmethods] {
+		if method == 0x00 {
+			supportsNoAuth = true
+			break
+		}
+	}
+	if !supportsNoAuth {
+		_, _ = c.Write([]byte{0x05, 0xff})
+		return
+	}
 	if _, err := c.Write([]byte{0x05, 0x00}); err != nil { // без аутентификации
 		return
 	}
@@ -85,10 +96,11 @@ func handleSOCKS5Conn(c net.Conn, active *atomic.Pointer[tunnel]) {
 	port := binary.BigEndian.Uint16(portBuf[:])
 
 	t := active.Load()
-	if t == nil {
+	if t == nil || !t.Borrow() {
 		writeSOCKS5Reply(c, 0x01)
 		return
 	}
+	defer t.Release()
 	remote, err := t.tnet.DialContext(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
 	if err != nil {
 		writeSOCKS5Reply(c, 0x05)
@@ -98,9 +110,27 @@ func handleSOCKS5Conn(c net.Conn, active *atomic.Pointer[tunnel]) {
 	writeSOCKS5Reply(c, 0x00)
 
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(remote, c); done <- struct{}{} }()
-	go func() { io.Copy(c, remote); done <- struct{}{} }()
+	go func() {
+		_, _ = io.Copy(remote, c)
+		closeWrite(remote)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(c, remote)
+		closeWrite(c)
+		done <- struct{}{}
+	}()
+	// A single io.Copy finishing only means one side half-closed its stream.
+	// Wait for the opposite direction too, otherwise a server response sent
+	// after client EOF is lost.
 	<-done
+	<-done
+}
+
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
 }
 
 func writeSOCKS5Reply(c net.Conn, rep byte) {
