@@ -15,6 +15,17 @@ expect_false() { local label="$1"; shift; if "$@"; then fail "$label"; fi; }
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
+cat > "$tmp_dir/wireproxy-release.json" <<'JSON'
+{"assets":[
+  {"name":"wireproxy_linux_arm64.tar.gz","browser_download_url":"https://example.invalid/arm64"},
+  {"name":"wireproxy_linux_arm.tar.gz","browser_download_url":"https://example.invalid/arm"},
+  {"name":"wireproxy_linux_amd64.tar.gz","browser_download_url":"https://example.invalid/amd64"}
+]}
+JSON
+[[ "$(select_wireproxy_release_url armv7l "$tmp_dir/wireproxy-release.json")" == "https://example.invalid/arm" ]] || fail "ARMv7 must not select ARM64 asset"
+[[ "$(select_wireproxy_release_url aarch64 "$tmp_dir/wireproxy-release.json")" == "https://example.invalid/arm64" ]] || fail "AArch64 asset selection"
+[[ "$(select_wireproxy_release_url x86_64 "$tmp_dir/wireproxy-release.json")" == "https://example.invalid/amd64" ]] || fail "AMD64 asset selection"
+
 [[ "$(normalize_code_list 'hel, arn HEL')" == "HEL,ARN" ]] || fail "normalize_code_list"
 parse_args --scanner auto --node 'hel,arn' --avoid-country ru --policy-mode strict --stability-probes 7
 [[ "$SCANNER:$NODE_ALLOW:$COUNTRY_DENY:$POLICY_MODE:$STABILITY_PROBES" == "auto:HEL,ARN:RU:strict:7" ]] || fail "parse_args scanner/policy"
